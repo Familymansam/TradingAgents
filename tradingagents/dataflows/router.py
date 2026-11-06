@@ -17,7 +17,15 @@ from tradingagents.dataflows.vendors.alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_stock as get_alpha_vantage_stock,
 )
+from tradingagents.dataflows.vendors.anysearch.news import (
+    get_global_news as get_anysearch_global_news,
+    get_news as get_anysearch_news,
+)
 from tradingagents.dataflows.vendors.fred import get_macro_data as get_fred_macro_data
+from tradingagents.dataflows.vendors.google_news.news import (
+    get_global_news as get_google_global_news,
+    get_news as get_google_news,
+)
 from tradingagents.dataflows.vendors.polymarket import (
     get_prediction_markets as get_polymarket_prediction_markets,
 )
@@ -125,12 +133,18 @@ VENDOR_METHODS = {
         "sec_edgar": get_sec_edgar_income_statement,
         "yfinance": get_yfinance_income_statement,
     },
-    # news_data
+    # news_data. google_news is the dated RSS source. anysearch is the live
+    # undated supplement/fallback. yfinance and alpha_vantage stay available
+    # when a chain names them; they are not the default for these two tools.
     "get_news": {
-        "alpha_vantage": get_alpha_vantage_news,
+        "google_news": get_google_news,
+        "anysearch": get_anysearch_news,
         "yfinance": get_news_yfinance,
+        "alpha_vantage": get_alpha_vantage_news,
     },
     "get_global_news": {
+        "google_news": get_google_global_news,
+        "anysearch": get_anysearch_global_news,
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
     },
