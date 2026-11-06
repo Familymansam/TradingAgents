@@ -1,0 +1,2462 @@
+diff --git a/.env.example b/.env.example
+index eaa51ca..c0546f1 100644
+--- a/.env.example
++++ b/.env.example
+@@ -22,6 +22,10 @@ NVIDIA_API_KEY=
+ # FRED (Federal Reserve macro data). Free key: https://fred.stlouisfed.org/docs/api/api_key.html
+ #FRED_API_KEY=
+ 
++# AnySearch live news fallback (optional). The key stays in this environment.
++# Do not commit a real value. Docs: https://www.anysearch.com/docs/api-endpoints/v1-search
++#ANYSEARCH_API_KEY=
++
+ # TypeSafe Jev: screens StockTwits and Reddit posts for the Sentiment Analyst. Optional.
+ #TYPESAFE_API_KEY=
+ #TYPESAFE_DEFAULT_MODEL=jev-latest
+diff --git a/README.md b/README.md
+index 9567a73..b18861e 100644
+--- a/README.md
++++ b/README.md
+@@ -175,6 +175,7 @@ export MOONSHOT_API_KEY=...        # Kimi (Moonshot)
+ export GROQ_API_KEY=...            # Groq
+ export NVIDIA_API_KEY=...          # NVIDIA NIM
+ export FRED_API_KEY=...            # FRED macro data (free, optional)
++export ANYSEARCH_API_KEY=...       # AnySearch news fallback (optional; leave unset to use Google News RSS only)
+ export ALPHA_VANTAGE_API_KEY=...   # Alpha Vantage
+ export TYPESAFE_API_KEY=...        # Jev social-post screening (optional)
+ ```
+@@ -189,6 +190,8 @@ For local models, configure Ollama with `llm_provider: "ollama"`. The default en
+ 
+ For any other OpenAI-compatible server (vLLM, LM Studio, llama.cpp, or a custom relay), use `llm_provider: "openai_compatible"` and set the endpoint via `backend_url` (or `TRADINGAGENTS_LLM_BACKEND_URL`), e.g. `http://localhost:8000/v1` for vLLM or `http://localhost:1234/v1` for LM Studio. The model is whatever your server serves. No key is needed for local servers; set `OPENAI_COMPATIBLE_API_KEY` when the endpoint requires one.
+ 
++Company and macro news (`get_news`, `get_global_news`) is read from Google News RSS, then from AnySearch `finance.news` when `ANYSEARCH_API_KEY` is set. RSS items keep the publication time Google sent. AnySearch rows are headlines and snippets with no reliable publication time, so they are used only for a window that reaches today and are labeled as undated. Yahoo Finance news is still registered and is used only if you add `yfinance` to those two tool chains. Price, indicator, fundamental, and insider vendors are unchanged. Details, the parent-box patch, and rollback steps are in `docs/news-google-anysearch.md`.
++
+ With `TYPESAFE_API_KEY` set, the Sentiment Analyst screens StockTwits and Reddit posts with TypeSafe's Jev before reading them. Posts that are not about the company are dropped, and each source opens with a count of the remaining posts by stance: bullish, bearish, neutral, or unclear. Without the key, posts pass through unscreened. `jev-latest` moves with new releases; set `TYPESAFE_DEFAULT_MODEL` to a versioned ID such as `jev-1.13.0` to hold it fixed across runs. To reach Jev through OpenRouter, put an OpenRouter key in `TYPESAFE_API_KEY` and set `TYPESAFE_BASE_URL=https://openrouter.ai/api`.
+ 
+ Alternatively, copy `.env.example` to `.env` and fill in your keys:
+diff --git a/docs/news-google-anysearch.md b/docs/news-google-anysearch.md
+new file mode 100644
+index 0000000..44dc79c
+--- /dev/null
++++ b/docs/news-google-anysearch.md
+@@ -0,0 +1,218 @@
++# Google News RSS and AnySearch news
++
++This fork reads `get_news` (one ticker) and `get_global_news` (macro) from Google News RSS, then from AnySearch when a window reaches today. Yahoo Finance news and Alpha Vantage stay registered. They are not called unless a chain names them. Price, indicator, fundamental, and insider vendors are unchanged.
++
++The patch is against fork `main` at `9fa1196` (TradingAgents 0.7.1). A parent checkout that has diverged, or that carries a local edit to `tradingagents/dataflows/vendors/yahoo/news.py`, must not be overwritten with this tree.
++
++## What each source is allowed to claim
++
++| Source | What is stored | Publication time | Historical window |
++| --- | --- | --- | --- |
++| Google News RSS | Headline, publisher, snippet when the feed has one, Google News link | `pubDate`, converted to UTC. Missing or unparseable means unknown. | Kept only when the UTC timestamp falls in `[start, end + 1 day)`. |
++| AnySearch `finance.news` | Headline, snippet, result URL. The `content` field is not copied into the report. | No reliable `published_at`. A timestamp is shown only when the payload actually contains one that parses. | Not called. Undated rows are not historical evidence. |
++
++Nothing in this path invents a date from a headline or a snippet. An empty feed, a transport error, and a quota error are reported as unavailable, not as "no news happened."
++
++Google News RSS is a recent sample, not an archive. A past window the feed does not reach is an unavailable window.
++
++## Vendor chain
++
++`tool_vendors` overrides the category default:
++
++```python
++"get_news": "google_news,anysearch",
++"get_global_news": "google_news,anysearch",
++```
++
++`data_vendors["news_data"]` stays `yfinance` so insider transactions still use Yahoo. To try Yahoo news only after the new sources fail, set the chain to `google_news,anysearch,yfinance`. To use the local Yahoo news patch only, set both tools to `yfinance`.
++
++Do not add `alpha_vantage` for these tools. `NEWS_SENTIMENT` is a premium endpoint.
++
++On a window that reaches today, Google News RSS also calls AnySearch and appends rows it did not already return (`news_anysearch_supplement`, default true). That call is skipped when `ANYSEARCH_API_KEY` is unset. Set `news_anysearch_supplement` to false to keep AnySearch as router fallback only (RSS failure, then one AnySearch call).
++
++## AnySearch request
++
++`POST https://api.anysearch.com/v1/search` with `Authorization: Bearer $ANYSEARCH_API_KEY`.
++
++The finance catalog (read from `GET /v1/sub-domains?domain=finance` on 2026-11-06; no API key) defines `finance.news` as:
++
++- `type=stock` and `symbol` for one international ticker. Query text is `{SYMBOL} stock news`.
++- `type=general` for global English financial news. There is no topic parameter. Macro calls send the configured topic query as `query` and `type=general`, which is the documented English-finance constraint. Untagged general search is not used.
++- `period` is a live lookback such as `7d` or `{N}d`, capped by `anysearch_max_period_days` (default 14). It is not an as-of historical filter.
++- `language=en` and `zone=intl` are the documented top-level fields.
++- `max_results` is clamped to 1–10.
++
++Macro AnySearch calls use the first `anysearch_macro_query_limit` entries of `news_macro_queries` (default 2) so one report does not spend the whole quota. Google News RSS runs every query in that list, with `after:` / `before:` added. `before:` is the day after `end_date`; the `pubDate` filter is what enforces the window. Yahoo still uses `global_news_queries`, which this change does not rewrite.
++
++`finance.macro` is an indicator feed, not news, and is not called. `type=flash` and `type=announcement` are Chinese-source feeds and are not called.
++
++## Failure, cache, and secrets
++
++- Timeout default 12 seconds. One retry after the first attempt on transport errors, HTTP 429, and HTTP 5xx. The wait is at most 8 seconds and honors a numeric `Retry-After` up to that cap.
++- HTTP 402 and a 429 that survives the retry arm a process-local backoff (default 60 seconds, cap 120). Later AnySearch calls in that process fail immediately with `quota backoff` and do not send another request.
++- Successful public payloads are cached under `data_cache_dir/news` for `news_cache_ttl_seconds` (default 900). The cache key is the query, not the API key. A body that contains the key is not cached.
++- Logs and tool text for AnySearch errors contain the HTTP status and `X-Request-ID` only. A 402 body can contain a generated password and key; it is not read into the report or the log.
++- The key is read from `ANYSEARCH_API_KEY` at call time. It is not written into config, reports, or this repository.
++
++## Configure
++
++In the environment that runs TradingAgents, not in git:
++
++```bash
++export ANYSEARCH_API_KEY=...   # parent box only
++```
++
++Leave it unset to run on Google News RSS alone. Restart the process after changing the key or `tool_vendors`.
++
++## Tests
++
++Unit tests mock HTTP. They cover bad RSS XML, a refused DTD, window filters, a `+0500` timestamp, undated RSS rows, AnySearch schema (`content` dropped), auth 401, HTTP 502, HTTP 402/429 without the body, unknown and future dates, historical withholding, router fallback, cache TTL, and redaction of a fake key.
++
++`pytest -m integration tests/test_google_news_rss.py` fetches live Google News RSS for AMD and one macro query. AnySearch is not called in that test. Authenticated AnySearch is for the parent box to live-test; this workspace does not have the key and does not request it.
++
++## Deploy on the parent box
++
++The production tree is the upstream checkout plus a local Yahoo news edit. Preserve both of these files. Do not delete the backup, and do not `git checkout` a clean copy over them:
++
++- `tradingagents/dataflows/vendors/yahoo/news.py`
++- `tradingagents/dataflows/vendors/yahoo/news.py.bak_20261103`
++
++This patch does not modify those paths. Do not assume the parent layout matches this fork. If `git apply --check` fails, stop and use the manual file list below. Do not apply with `--reject` and then guess.
++
++### 1. Save the local Yahoo news files
++
++```bash
++cd /workspace/TradingAgents
++git rev-parse HEAD > /tmp/tradingagents-parent-head.txt
++git diff -- tradingagents/dataflows/vendors/yahoo/news.py > /tmp/yahoo-news.parent.patch
++cp -a tradingagents/dataflows/vendors/yahoo/news.py /tmp/yahoo-news.py.parent
++cp -a tradingagents/dataflows/vendors/yahoo/news.py.bak_20261103 /tmp/yahoo-news.py.bak_20261103
++```
++
++Confirm the backup copy is non-empty before continuing:
++
++```bash
++test -s /tmp/yahoo-news.py.parent && test -s /tmp/yahoo-news.py.bak_20261103
++```
++
++### 2. Apply the fork patch
++
++Copy `deploy/google-news-anysearch.patch` from this fork onto the parent box. From the production repo root:
++
++```bash
++git apply --check deploy/google-news-anysearch.patch
++git apply deploy/google-news-anysearch.patch
++cmp tradingagents/dataflows/vendors/yahoo/news.py /tmp/yahoo-news.py.parent
++cmp tradingagents/dataflows/vendors/yahoo/news.py.bak_20261103 /tmp/yahoo-news.py.bak_20261103
++```
++
++`cmp` must print nothing. If either file differs, restore it from `/tmp` before starting the process:
++
++```bash
++cp -a /tmp/yahoo-news.py.parent tradingagents/dataflows/vendors/yahoo/news.py
++cp -a /tmp/yahoo-news.py.bak_20261103 tradingagents/dataflows/vendors/yahoo/news.py.bak_20261103
++```
++
++### 3. If the patch does not apply
++
++The parent is not at the same base as this fork. Copy these new files in place (they only import modules that already exist: `config`, `date_window`, `errors`, and `requests`):
++
++- `tradingagents/dataflows/news_support.py`
++- `tradingagents/dataflows/vendors/google_news/__init__.py`
++- `tradingagents/dataflows/vendors/google_news/news.py`
++- `tradingagents/dataflows/vendors/anysearch/__init__.py`
++- `tradingagents/dataflows/vendors/anysearch/news.py`
++
++Then register them by hand. In `tradingagents/dataflows/router.py` add:
++
++```python
++from tradingagents.dataflows.vendors.anysearch.news import (
++    get_global_news as get_anysearch_global_news,
++    get_news as get_anysearch_news,
++)
++from tradingagents.dataflows.vendors.google_news.news import (
++    get_global_news as get_google_global_news,
++    get_news as get_google_news,
++)
++```
++
++In `VENDOR_METHODS["get_news"]` and `VENDOR_METHODS["get_global_news"]`, add `"google_news"` and `"anysearch"` ahead of `"yfinance"`. Leave `get_insider_transactions`, `get_stock_data`, and the fundamental methods as they are.
++
++In the config the process actually loads, set:
++
++```python
++"tool_vendors": {
++    "get_news": "google_news,anysearch",
++    "get_global_news": "google_news,anysearch",
++},
++```
++
++The other keys (`news_macro_queries`, timeouts, cache TTL, AnySearch URL) have defaults inside the new modules, so a partial config still runs. Copy them from `tradingagents/default_config.py` in this fork if you want them editable.
++
++Do not replace `tradingagents/dataflows/vendors/yahoo/news.py`.
++
++### 4. Install and point the key at the process
++
++```bash
++pip install -e .
++# ANYSEARCH_API_KEY belongs in the parent environment or its untracked .env.
++# Do not commit it and do not paste it into the patch.
++```
++
++Restart the process that imports `tradingagents`. A remote test is not a deployment until this process is the one that serves the workflow.
++
++### 5. Live check on the parent
++
++Use the parent's environment. This confirms RSS dates and that AnySearch rows are labeled undated. It does not print the key.
++
++```bash
++python - <<'PY'
++import os
++from datetime import date, timedelta
++from tradingagents.dataflows.vendors.google_news.news import get_news, get_global_news
++
++assert "ANYSEARCH_API_KEY" in os.environ and os.environ["ANYSEARCH_API_KEY"].strip()
++today = date.today()
++start = today - timedelta(days=3)
++ticker = get_news("AMD", start.isoformat(), today.isoformat())
++macro = get_global_news(today.isoformat(), 3, 5)
++key = os.environ["ANYSEARCH_API_KEY"]
++for name, text in ("ticker", ticker), ("macro", macro):
++    assert key not in text, name
++    print("---", name, "chars", len(text))
++    print(text[:1500])
++PY
++```
++
++Expect `publication time known` on RSS rows and, when AnySearch returns rows, `Published: unknown` plus `not historical validated evidence`. A historical date should not contain AnySearch rows:
++
++```bash
++python - <<'PY'
++from tradingagents.dataflows.vendors.google_news.news import get_news
++text = get_news("AMD", "2024-06-01", "2024-06-07")
++assert "AnySearch" not in text
++print(text[:800])
++PY
++```
++
++## Rollback
++
++From the production repo root, if the patch applied cleanly:
++
++```bash
++git apply -R --check deploy/google-news-anysearch.patch
++git apply -R deploy/google-news-anysearch.patch
++cmp tradingagents/dataflows/vendors/yahoo/news.py /tmp/yahoo-news.py.parent
++cmp tradingagents/dataflows/vendors/yahoo/news.py.bak_20261103 /tmp/yahoo-news.py.bak_20261103
++```
++
++If `git apply -R` cannot reverse a hand-merge, delete only the five new files listed above and remove the `google_news` / `anysearch` registrations and the `tool_vendors` overrides you added. Then:
++
++```bash
++cp -a /tmp/yahoo-news.py.parent tradingagents/dataflows/vendors/yahoo/news.py
++cp -a /tmp/yahoo-news.py.bak_20261103 tradingagents/dataflows/vendors/yahoo/news.py.bak_20261103
++```
++
++Restart the process. Unset `ANYSEARCH_API_KEY` only if you also want the process to stop presenting it to anything else; rollback of this code does not require deleting the key.
++
++Do not roll back by checking out upstream `tradingagents/dataflows/vendors/yahoo/news.py`. That drops the local patch saved in `/tmp/yahoo-news.py.parent`.
+diff --git a/tests/test_anysearch_news.py b/tests/test_anysearch_news.py
+new file mode 100644
+index 0000000..dbff46b
+--- /dev/null
++++ b/tests/test_anysearch_news.py
+@@ -0,0 +1,330 @@
++"""AnySearch finance.news: schema, auth, quota, unknown dates, and secret redaction."""
++
++import json
++from datetime import UTC, datetime, timedelta
++
++import pytest
++import requests
++
++from tradingagents.dataflows.config import set_config
++from tradingagents.dataflows.errors import VendorNotConfiguredError, VendorUnavailableError
++from tradingagents.dataflows.news_support import clear_news_cache
++from tradingagents.dataflows.vendors.anysearch import news as anysearch
++
++SECRET = "as-sk-test-DO_NOT_LEAK_9f3c"
++PASSWORD = "anysearch-password-DO_NOT_LEAK"
++
++
++class _Resp:
++    def __init__(self, status, payload=None, headers=None, raw=None):
++        self.status_code = status
++        self.headers = headers or {}
++        self._payload = payload
++        self._raw = raw
++        self.content = raw if raw is not None else json.dumps(payload or {}).encode()
++
++    def json(self):
++        if self._payload is None:
++            raise ValueError("not json")
++        return self._payload
++
++
++@pytest.fixture(autouse=True)
++def _isolated(monkeypatch, tmp_path):
++    clear_news_cache()
++    anysearch.clear_quota_backoff()
++    monkeypatch.setenv("ANYSEARCH_API_KEY", SECRET)
++    set_config({
++        "data_cache_dir": str(tmp_path),
++        "news_cache_ttl_seconds": 900,
++        "news_http_max_retries": 1,
++        "anysearch_macro_query_limit": 2,
++        "anysearch_quota_backoff_seconds": 60,
++    })
++    monkeypatch.setattr("tradingagents.dataflows.news_support._sleep", lambda seconds: None)
++    yield
++    clear_news_cache()
++    anysearch.clear_quota_backoff()
++
++
++def _http(monkeypatch, responses):
++    calls = []
++
++    def request(method, url, **kwargs):
++        calls.append((method, url, kwargs))
++        made = responses.pop(0)
++        if isinstance(made, Exception):
++            raise made
++        return made
++
++    monkeypatch.setattr("tradingagents.dataflows.news_support.requests.request", request)
++    return calls
++
++
++def _window():
++    today = datetime.now(UTC).date()
++    return (today - timedelta(days=3)).isoformat(), today.isoformat()
++
++
++def _ok(results, request_id="req-ok"):
++    return _Resp(
++        200,
++        {"code": 0, "message": "success", "request_id": request_id,
++         "data": {"results": results, "metadata": {"total_results": len(results)}}},
++        headers={"X-Request-ID": request_id},
++    )
++
++
++@pytest.mark.unit
++def test_stock_schema_uses_headline_and_snippet_not_content(monkeypatch):
++    start, end = _window()
++    calls = _http(monkeypatch, [_ok([{
++        "title": "AMD raises outlook",
++        "url": "https://www.example.com/amd",
++        "snippet": "The company raised its outlook.",
++        "content": "FULLTEXT_SHOULD_NOT_APPEAR published on 1999-01-01",
++    }])])
++
++    out = anysearch.get_news("amd", start, end)
++
++    assert "AMD raises outlook" in out
++    assert "Snippet: The company raised its outlook." in out
++    assert "Link: https://www.example.com/amd" in out
++    assert "Publisher: example.com" in out
++    assert "FULLTEXT_SHOULD_NOT_APPEAR" not in out
++    assert "1999-01-01" not in out
++    assert "Published: unknown" in out
++    assert "not historical validated evidence" in out
++    assert "not the full article" in out
++    assert "Attribution: AnySearch finance.news type=stock symbol=AMD" in out
++    assert "Undated items: 1" in out
++    assert SECRET not in out
++    payload = calls[0][2]["json"]
++    assert calls[0][0] == "POST"
++    assert calls[0][1] == "https://api.anysearch.com/v1/search"
++    assert payload["tag"] == "finance.news"
++    assert payload["query"] == "AMD stock news"
++    assert payload["params"] == {"type": "stock", "symbol": "AMD", "period": "4d"}
++    assert payload["language"] == "en"
++    assert payload["zone"] == "intl"
++    assert payload["max_results"] == 10
++    assert calls[0][2]["headers"]["Authorization"] == f"Bearer {SECRET}"
++    assert "content" not in payload
++
++
++@pytest.mark.unit
++def test_macro_uses_type_general_and_topic_queries(monkeypatch):
++    _start, end = _window()
++    calls = _http(monkeypatch, [
++        _ok([{"title": "Fed watch", "url": "https://news.example/fed", "snippet": "rates"}]),
++        _ok([{"title": "Earnings week", "url": "https://news.example/earn", "snippet": "gdp"}]),
++        _ok([{"title": "SHOULD NOT REQUEST", "url": "https://news.example/no", "snippet": "x"}]),
++    ])
++
++    out = anysearch.get_global_news(end, look_back_days=3, limit=10)
++
++    assert len(calls) == 2
++    assert calls[0][2]["json"]["params"] == {"type": "general", "period": "4d"}
++    assert "symbol" not in calls[0][2]["json"]["params"]
++    assert "Federal Reserve" in calls[0][2]["json"]["query"]
++    assert "S&P 500" in calls[1][2]["json"]["query"]
++    assert "Fed watch" in out and "Earnings week" in out
++    assert "SHOULD NOT REQUEST" not in out
++    assert "type=general" in out
++
++
++@pytest.mark.unit
++def test_known_published_at_is_kept_and_a_future_one_is_dropped(monkeypatch):
++    start, end = _window()
++    yesterday = (datetime.now(UTC).date() - timedelta(days=1)).isoformat() + "T15:04:00Z"
++    _http(monkeypatch, [_ok([
++        {"title": "YESTERDAY", "url": "https://news.example/y", "snippet": "in range",
++         "published_at": yesterday},
++        {"title": "FUTURE", "url": "https://news.example/f", "snippet": "ahead",
++         "published_at": "2099-01-01T00:00:00Z"},
++        {"title": "GARBAGE DATE", "url": "https://news.example/g", "snippet": "no real time",
++         "published_at": "not-a-date"},
++    ])])
++
++    out = anysearch.get_news("AMD", start, end)
++
++    assert "YESTERDAY" in out
++    assert "publication time known" in out
++    assert yesterday[:10] in out
++    assert "FUTURE" not in out
++    assert "GARBAGE DATE" in out
++    assert "Published: unknown" in out
++
++
++@pytest.mark.unit
++def test_historical_window_does_not_call_the_api(monkeypatch):
++    def request(*args, **kwargs):
++        raise AssertionError("historical AnySearch must not be requested")
++
++    monkeypatch.setattr("tradingagents.dataflows.news_support.requests.request", request)
++    with pytest.raises(VendorUnavailableError, match="not historical validated evidence"):
++        anysearch.get_news("AMD", "2024-01-01", "2024-01-08")
++    with pytest.raises(VendorUnavailableError, match="not historical validated evidence"):
++        anysearch.get_global_news("2024-01-08", 7, 5)
++
++
++@pytest.mark.unit
++def test_missing_key_is_not_configured(monkeypatch):
++    monkeypatch.delenv("ANYSEARCH_API_KEY", raising=False)
++    start, end = _window()
++
++    def request(*args, **kwargs):
++        raise AssertionError("missing key must not call AnySearch")
++
++    monkeypatch.setattr("tradingagents.dataflows.news_support.requests.request", request)
++    with pytest.raises(VendorNotConfiguredError, match="ANYSEARCH_API_KEY"):
++        anysearch.get_news("AMD", start, end)
++
++
++@pytest.mark.unit
++def test_auth_failure_hides_the_body(monkeypatch):
++    start, end = _window()
++    _http(monkeypatch, [_Resp(
++        401,
++        raw=json.dumps({"message": f"bad key {SECRET}"}).encode(),
++        headers={"X-Request-ID": "req-auth"},
++    )])
++    with pytest.raises(VendorNotConfiguredError) as caught:
++        anysearch.get_news("AMD", start, end)
++    assert SECRET not in str(caught.value)
++    assert "bad key" not in str(caught.value)
++    assert "HTTP 401" in str(caught.value)
++    assert "req-auth" in str(caught.value)
++
++
++@pytest.mark.unit
++def test_server_error_is_unavailable(monkeypatch):
++    start, end = _window()
++    calls = _http(monkeypatch, [
++        _Resp(502, headers={"X-Request-ID": "req-bad"}),
++        _Resp(502, headers={"X-Request-ID": "req-bad-2"}),
++    ])
++    with pytest.raises(VendorUnavailableError, match="HTTP 502"):
++        anysearch.get_news("AMD", start, end)
++    assert len(calls) == 2  # one bounded retry
++
++
++@pytest.mark.unit
++def test_quota_body_is_not_logged_and_further_calls_back_off(monkeypatch, caplog):
++    start, end = _window()
++    calls = _http(monkeypatch, [_Resp(
++        402,
++        raw=json.dumps({
++            "message": f"username=somebody password={PASSWORD} api_key={SECRET}",
++        }).encode(),
++        headers={"X-Request-ID": "req-quota"},
++    )])
++    with caplog.at_level("WARNING"):
++        with pytest.raises(VendorUnavailableError) as caught:
++            anysearch.get_news("AMD", start, end)
++        with pytest.raises(VendorUnavailableError, match="quota backoff"):
++            anysearch.get_news("AMD", start, end)
++    assert len(calls) == 1
++    assert PASSWORD not in str(caught.value)
++    assert SECRET not in str(caught.value)
++    assert PASSWORD not in caplog.text
++    assert SECRET not in caplog.text
++    assert "req-quota" in str(caught.value)
++
++
++@pytest.mark.unit
++def test_rate_limit_retries_once_then_backs_off_without_the_body(monkeypatch, caplog):
++    start, end = _window()
++    calls = _http(monkeypatch, [
++        _Resp(429, raw=f"slow down {SECRET}".encode(), headers={"Retry-After": "0", "X-Request-ID": "req-rl"}),
++        _Resp(429, raw=f"still {PASSWORD}".encode(), headers={"Retry-After": "30", "X-Request-ID": "req-rl2"}),
++    ])
++    with caplog.at_level("WARNING"), pytest.raises(VendorUnavailableError, match="HTTP 429") as caught:
++        anysearch.get_news("AMD", start, end)
++    assert len(calls) == 2
++    assert SECRET not in str(caught.value) and PASSWORD not in str(caught.value)
++    assert SECRET not in caplog.text and PASSWORD not in caplog.text
++    calls.clear()
++    with pytest.raises(VendorUnavailableError, match="quota backoff"):
++        anysearch.get_news("NVDA", start, end)
++    assert calls == []
++
++
++@pytest.mark.unit
++def test_transport_error_redacts_the_key(monkeypatch, caplog):
++    start, end = _window()
++    _http(monkeypatch, [
++        requests.ConnectionError(f"timed out Authorization: Bearer {SECRET}"),
++        requests.ConnectionError(f"timed out Authorization: Bearer {SECRET}"),
++    ])
++    with caplog.at_level("WARNING"), pytest.raises(VendorUnavailableError) as caught:
++        anysearch.get_news("AMD", start, end)
++    assert SECRET not in str(caught.value)
++    assert "Bearer ***" in str(caught.value)
++    assert SECRET not in caplog.text
++
++
++@pytest.mark.unit
++def test_nonzero_code_does_not_surface_the_message(monkeypatch):
++    start, end = _window()
++    _http(monkeypatch, [_Resp(
++        200,
++        {"code": -1, "message": f"leaked {SECRET}", "request_id": "req-code"},
++        headers={"X-Request-ID": "req-code"},
++    )])
++    with pytest.raises(VendorUnavailableError) as caught:
++        anysearch.get_news("AMD", start, end)
++    assert SECRET not in str(caught.value)
++    assert "leaked" not in str(caught.value)
++    assert "code -1" in str(caught.value)
++
++
++@pytest.mark.unit
++def test_results_that_are_not_a_list_are_unavailable(monkeypatch):
++    start, end = _window()
++    _http(monkeypatch, [_Resp(
++        200,
++        {"code": 0, "message": "success", "data": {"results": {"title": "nope"}}},
++        headers={"X-Request-ID": "req-shape"},
++    )])
++    with pytest.raises(VendorUnavailableError, match="no results array"):
++        anysearch.get_news("AMD", start, end)
++
++
++@pytest.mark.unit
++def test_empty_success_is_unavailable_not_silence(monkeypatch):
++    start, end = _window()
++    _http(monkeypatch, [_ok([])])
++    with pytest.raises(VendorUnavailableError, match="no usable"):
++        anysearch.get_news("AMD", start, end)
++
++
++@pytest.mark.unit
++def test_success_is_cached_without_the_key(monkeypatch, tmp_path):
++    start, end = _window()
++    calls = _http(monkeypatch, [
++        _ok([{"title": "Cached AMD", "url": "https://news.example/c", "snippet": "s"}]),
++        _ok([{"title": "SHOULD NOT FETCH", "url": "https://news.example/z", "snippet": "z"}]),
++    ])
++    first = anysearch.get_news("AMD", start, end)
++    second = anysearch.get_news("AMD", start, end)
++    assert first == second
++    assert "Cached AMD" in first
++    assert len(calls) == 1
++    stored = list(tmp_path.rglob("*.json"))
++    assert stored
++    blob = "\n".join(path.read_text(encoding="utf-8") for path in stored)
++    assert SECRET not in blob
++    assert "Cached AMD" in blob
++
++
++@pytest.mark.unit
++def test_unsafe_symbol_is_not_sent(monkeypatch):
++    start, end = _window()
++
++    def request(*args, **kwargs):
++        raise AssertionError("bad symbol must not be sent")
++
++    monkeypatch.setattr("tradingagents.dataflows.news_support.requests.request", request)
++    with pytest.raises(VendorUnavailableError, match="not a usable AnySearch"):
++        anysearch.get_news("AMD OR secret", start, end)
+diff --git a/tests/test_google_news_rss.py b/tests/test_google_news_rss.py
+new file mode 100644
+index 0000000..8b589a1
+--- /dev/null
++++ b/tests/test_google_news_rss.py
+@@ -0,0 +1,413 @@
++"""Google News RSS: bad XML, date filters, time zones, cache, and live supplement."""
++
++import time
++from datetime import UTC, datetime, timedelta
++
++import pytest
++
++from tradingagents.dataflows.config import set_config
++from tradingagents.dataflows.errors import VendorUnavailableError
++from tradingagents.dataflows.news_support import NewsItem, clear_news_cache
++from tradingagents.dataflows.vendors.google_news import news as gnews
++
++
++class _Resp:
++    def __init__(self, status, body, headers=None):
++        self.status_code = status
++        self.content = body if isinstance(body, bytes) else body.encode()
++        self.headers = headers or {}
++
++
++def _rfc(day, time="12:00:00", tz="GMT"):
++    stamp = datetime.strptime(f"{day} {time}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
++    return stamp.strftime("%a, %d %b %Y %H:%M:%S ") + tz
++
++
++def _rss(items):
++    rows = []
++    for item in items:
++        pub = item.get("pub")
++        pub_xml = f"<pubDate>{pub}</pubDate>" if pub is not None else ""
++        rows.append(
++            "<item>"
++            f"<title>{item['title']}</title>"
++            f"<link>{item['link']}</link>"
++            f"{pub_xml}"
++            f"<description>{item.get('description', '')}</description>"
++            f"<source url=\"{item.get('source_url', '')}\">{item.get('source', '')}</source>"
++            "</item>"
++        )
++    return "<?xml version='1.0'?><rss version='2.0'><channel>" + "".join(rows) + "</channel></rss>"
++
++
++@pytest.fixture(autouse=True)
++def _isolated(monkeypatch, tmp_path):
++    clear_news_cache()
++    set_config({
++        "data_cache_dir": str(tmp_path),
++        "news_anysearch_supplement": False,
++        "news_cache_ttl_seconds": 900,
++        "news_http_max_retries": 1,
++    })
++    monkeypatch.setattr("tradingagents.dataflows.news_support._sleep", lambda seconds: None)
++    yield
++    clear_news_cache()
++
++
++def _route_http(monkeypatch, responses):
++    calls = []
++
++    def request(method, url, **kwargs):
++        calls.append((method, url, kwargs))
++        body = responses.pop(0)
++        if isinstance(body, Exception):
++            raise body
++        return body
++
++    monkeypatch.setattr("tradingagents.dataflows.news_support.requests.request", request)
++    return calls
++
++
++@pytest.mark.unit
++def test_bad_xml_is_unavailable(monkeypatch):
++    calls = _route_http(monkeypatch, [_Resp(200, "<rss><channel><item><title>x</title>")])
++    with pytest.raises(VendorUnavailableError, match="not valid XML"):
++        gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert len(calls) == 1
++
++
++@pytest.mark.unit
++def test_dtd_entity_is_refused():
++    with pytest.raises(VendorUnavailableError, match="DTD"):
++        gnews.parse_feed("<!DOCTYPE rss [<!ENTITY x 'y'>]><rss/>")
++
++
++@pytest.mark.unit
++def test_filters_future_items_and_keeps_the_end_date(monkeypatch):
++    xml = _rss([
++        {"title": "INSIDE", "link": "https://news.google.com/rss/articles/inside",
++         "pub": "Fri, 09 May 2025 23:59:59 GMT", "source": "CNBC",
++         "source_url": "https://www.cnbc.com", "description": "A real snippet"},
++        {"title": "MIDNIGHT AFTER", "link": "https://news.google.com/rss/articles/after",
++         "pub": "Sat, 10 May 2025 00:00:00 GMT", "source": "CNBC"},
++        {"title": "BEFORE", "link": "https://news.google.com/rss/articles/before",
++         "pub": "Wed, 30 Apr 2025 12:00:00 GMT", "source": "CNBC"},
++    ])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++
++    out = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++
++    assert "INSIDE" in out
++    assert "MIDNIGHT AFTER" not in out
++    assert "BEFORE" not in out
++    assert "2025-05-09 23:59 UTC (publication time known)" in out
++    assert "not the full article" in out
++    assert "Attribution: Google News RSS" in out
++    assert "Publisher: CNBC" in out
++    assert "Publisher site: https://www.cnbc.com" in out
++    assert "Snippet: A real snippet" in out
++    assert "Link: https://news.google.com/rss/articles/inside" in out
++    assert "Dated items: 1" in out
++    assert "Undated items: 0" in out
++
++
++@pytest.mark.unit
++def test_positive_offset_is_converted_to_utc(monkeypatch):
++    # 2025-05-10 01:00 +05:00 is 2025-05-09 20:00 UTC, inside a window ending the 9th.
++    xml = _rss([{
++        "title": "OFFSET",
++        "link": "https://news.google.com/rss/articles/offset",
++        "pub": "Sat, 10 May 2025 01:00:00 +0500",
++        "source": "Reuters",
++    }])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++
++    inside = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert "OFFSET" in inside
++    assert "2025-05-09 20:00 UTC" in inside
++
++
++@pytest.mark.unit
++def test_offset_falls_outside_the_utc_day(monkeypatch):
++    xml = _rss([{
++        "title": "NEXT UTC DAY",
++        "link": "https://news.google.com/rss/articles/next",
++        "pub": "Sat, 10 May 2025 01:00:00 +0500",
++        "source": "Reuters",
++    }])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    out = gnews.get_news("AMD", "2025-05-10", "2025-05-10")
++    # 01:00 at UTC+5 is still 2025-05-09 UTC, so it is outside this window.
++    assert "NEXT UTC DAY" not in out
++    assert "publication time known" not in out
++
++
++@pytest.mark.unit
++def test_undated_rss_item_is_dropped_for_a_past_window(monkeypatch):
++    xml = _rss([
++        {"title": "NO DATE", "link": "https://news.google.com/rss/articles/nodate", "source": "CNBC"},
++        {"title": "DATED", "link": "https://news.google.com/rss/articles/dated",
++         "pub": "Mon, 05 May 2025 12:00:00 GMT", "source": "CNBC"},
++    ])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    out = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert "DATED" in out
++    assert "NO DATE" not in out
++    assert "Undated items: 0" in out
++
++
++@pytest.mark.unit
++def test_undated_rss_item_is_labeled_when_the_window_reaches_today(monkeypatch):
++    today = datetime.now(UTC).strftime("%Y-%m-%d")
++    xml = _rss([
++        {"title": "NO DATE LIVE", "link": "https://news.google.com/rss/articles/live", "source": "CNBC"},
++    ])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    out = gnews.get_news("AMD", today, today)
++    assert "NO DATE LIVE" in out
++    assert "Published: unknown" in out
++    assert "not historical validated evidence" in out
++    assert "Undated items: 1" in out
++
++
++@pytest.mark.unit
++def test_items_after_the_window_are_not_an_absence_of_news(monkeypatch):
++    xml = _rss([{
++        "title": "LATER",
++        "link": "https://news.google.com/rss/articles/later",
++        "pub": "Sun, 01 Jun 2025 12:00:00 GMT",
++        "source": "CNBC",
++    }])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    out = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert "LATER" not in out
++    assert "unavailable" in out and "not an absence" in out
++
++
++@pytest.mark.unit
++def test_macro_query_is_topic_constrained_and_date_bounded(monkeypatch):
++    seen = []
++
++    def request(method, url, **kwargs):
++        seen.append(kwargs.get("params") or {})
++        xml = _rss([{
++            "title": "FED HOLDS",
++            "link": "https://news.google.com/rss/articles/fed",
++            "pub": "Thu, 08 May 2025 15:00:00 GMT",
++            "source": "Reuters",
++            "source_url": "https://www.reuters.com",
++        }])
++        return _Resp(200, xml)
++
++    monkeypatch.setattr(
++        "tradingagents.dataflows.news_support.requests.request", request,
++    )
++    out = gnews.get_global_news("2025-05-09", look_back_days=7, limit=5)
++
++    assert "FED HOLDS" in out
++    assert seen
++    query = seen[0]["q"]
++    assert query.startswith('(Federal Reserve OR FOMC)')
++    assert "after:2025-05-02" in query and "before:2025-05-10" in query
++    assert not query.startswith("((")
++    assert seen[0]["hl"] == "en-US" and seen[0]["ceid"] == "US:en"
++
++
++@pytest.mark.unit
++def test_http_error_retries_once_then_succeeds(monkeypatch):
++    xml = _rss([{
++        "title": "RECOVERED",
++        "link": "https://news.google.com/rss/articles/ok",
++        "pub": "Thu, 08 May 2025 15:00:00 GMT",
++        "source": "CNBC",
++    }])
++    calls = _route_http(monkeypatch, [_Resp(503, "nope"), _Resp(200, xml)])
++    out = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert "RECOVERED" in out
++    assert len(calls) == 2
++
++
++@pytest.mark.unit
++def test_http_error_that_outlasts_the_retry_is_unavailable(monkeypatch):
++    _route_http(monkeypatch, [_Resp(503, "nope"), _Resp(429, "still")])
++    with pytest.raises(VendorUnavailableError, match="HTTP 429"):
++        gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++
++
++@pytest.mark.unit
++def test_client_error_is_not_retried(monkeypatch):
++    calls = _route_http(monkeypatch, [_Resp(400, "bad")])
++    with pytest.raises(VendorUnavailableError, match="HTTP 400"):
++        gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert len(calls) == 1
++
++
++@pytest.mark.unit
++def test_successful_feed_is_cached(monkeypatch):
++    xml = _rss([{
++        "title": "CACHED",
++        "link": "https://news.google.com/rss/articles/cached",
++        "pub": "Thu, 08 May 2025 15:00:00 GMT",
++        "source": "CNBC",
++    }])
++    calls = _route_http(monkeypatch, [_Resp(200, xml), _Resp(200, "<not-used/>")])
++    assert "CACHED" in gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert "CACHED" in gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert len(calls) == 1
++
++
++@pytest.mark.unit
++def test_cache_expires(monkeypatch):
++    xml = _rss([{
++        "title": "ONCE",
++        "link": "https://news.google.com/rss/articles/once",
++        "pub": "Thu, 08 May 2025 15:00:00 GMT",
++        "source": "CNBC",
++    }])
++    calls = _route_http(monkeypatch, [_Resp(200, xml), _Resp(200, xml)])
++    # Start from the real clock so the file entry's mtime and the mocked clock
++    # agree; then step well past the TTL.
++    clock = {"now": time.time()}
++    monkeypatch.setattr("tradingagents.dataflows.news_support.time.time", lambda: clock["now"])
++    set_config({"news_cache_ttl_seconds": 10})
++    gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    clock["now"] += 30
++    gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert len(calls) == 2
++
++
++@pytest.mark.unit
++def test_duplicate_links_collapse(monkeypatch):
++    xml = _rss([
++        {"title": "SAME", "link": "https://news.google.com/rss/articles/same",
++         "pub": "Thu, 08 May 2025 15:00:00 GMT", "source": "CNBC"},
++        {"title": "SAME again", "link": "https://news.google.com/rss/articles/same",
++         "pub": "Thu, 08 May 2025 16:00:00 GMT", "source": "CNBC"},
++    ])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    out = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert out.count("### SAME") == 1
++
++
++@pytest.mark.unit
++def test_unsafe_ticker_is_not_sent(monkeypatch):
++    def request(*args, **kwargs):
++        raise AssertionError("unsafe ticker must not be requested")
++
++    monkeypatch.setattr("tradingagents.dataflows.news_support.requests.request", request)
++    with pytest.raises(VendorUnavailableError, match="not a usable news symbol"):
++        gnews.get_news("AMD OR site:evil.example", "2025-05-01", "2025-05-09")
++
++
++@pytest.mark.unit
++def test_live_supplement_is_appended_and_deduped(monkeypatch):
++    today = datetime.now(UTC).strftime("%Y-%m-%d")
++    xml = _rss([{
++        "title": "RSS ONLY",
++        "link": "https://news.google.com/rss/articles/rss",
++        "pub": _rfc(today),
++        "source": "CNBC",
++        "source_url": "https://www.cnbc.com",
++    }])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    set_config({"news_anysearch_supplement": True})
++    extra = [
++        NewsItem("RSS ONLY", "https://example.com/dup", "example.com", "dup", None,
++                 "AnySearch finance.news type=stock symbol=AMD"),
++        NewsItem("ANY ONLY", "https://example.com/amd", "example.com", "snippet text", None,
++                 "AnySearch finance.news type=stock symbol=AMD"),
++    ]
++    monkeypatch.setattr(
++        "tradingagents.dataflows.vendors.anysearch.news.search_ticker",
++        lambda *args, **kwargs: extra,
++    )
++
++    out = gnews.get_news("AMD", today, today)
++
++    assert "RSS ONLY" in out
++    assert "ANY ONLY" in out
++    assert out.count("### RSS ONLY") == 1
++    assert "not historical validated evidence" in out
++    assert "Snippet: snippet text" in out
++
++
++@pytest.mark.unit
++def test_supplement_failure_keeps_the_rss_report(monkeypatch):
++    today = datetime.now(UTC).strftime("%Y-%m-%d")
++    xml = _rss([{
++        "title": "STILL HERE",
++        "link": "https://news.google.com/rss/articles/still",
++        "pub": _rfc(today),
++        "source": "CNBC",
++    }])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    set_config({"news_anysearch_supplement": True})
++
++    def broken(*args, **kwargs):
++        raise VendorUnavailableError("AnySearch HTTP 502; request_id=abc")
++
++    monkeypatch.setattr(
++        "tradingagents.dataflows.vendors.anysearch.news.search_ticker", broken,
++    )
++    out = gnews.get_news("AMD", today, today)
++    assert "STILL HERE" in out
++    assert "request_id=abc" not in out
++
++
++@pytest.mark.unit
++def test_past_window_does_not_call_anysearch(monkeypatch):
++    xml = _rss([{
++        "title": "OLD",
++        "link": "https://news.google.com/rss/articles/old",
++        "pub": "Thu, 08 May 2025 15:00:00 GMT",
++        "source": "CNBC",
++    }])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    set_config({"news_anysearch_supplement": True})
++
++    def forbidden(*args, **kwargs):
++        raise AssertionError("AnySearch must not run for a historical window")
++
++    monkeypatch.setattr(
++        "tradingagents.dataflows.vendors.anysearch.news.search_ticker", forbidden,
++    )
++    out = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert "OLD" in out
++    assert "Undated items: 0" in out
++
++
++@pytest.mark.unit
++def test_description_that_is_only_a_link_is_not_a_snippet(monkeypatch):
++    xml = _rss([{
++        "title": "HEADLINE",
++        "link": "https://news.google.com/rss/articles/head",
++        "pub": "Thu, 08 May 2025 15:00:00 GMT",
++        "source": "CNBC",
++        "description": '<a href="https://news.google.com/rss/articles/head">https://news.google.com/rss/articles/head</a>',
++    }])
++    _route_http(monkeypatch, [_Resp(200, xml)])
++    out = gnews.get_news("AMD", "2025-05-01", "2025-05-09")
++    assert "Snippet: unavailable" in out
++    assert "Form: headline and snippet only" in out
++
++
++@pytest.mark.integration
++def test_live_google_news_rss_amd_and_macro(tmp_path):
++    """Hits the public RSS feed. Skipped unless pytest is run with -m integration."""
++    set_config({
++        "data_cache_dir": str(tmp_path),
++        "news_anysearch_supplement": False,
++        "news_http_max_retries": 1,
++    })
++    clear_news_cache()
++    today = datetime.now(UTC).date()
++    start = (today - timedelta(days=7)).isoformat()
++    ticker = gnews.get_news("AMD", start, today.isoformat())
++    macro = gnews.get_global_news(today.isoformat(), look_back_days=7, limit=5)
++    assert "Google News RSS" in ticker
++    assert "publication time known" in ticker
++    assert "Link: http" in ticker
++    assert "not the full article" in ticker
++    assert "Google News RSS" in macro
++    assert "Dated items:" in macro
++    assert "publication time known" in macro
+diff --git a/tests/test_news_lookahead.py b/tests/test_news_lookahead.py
+index 98db2bd..2313572 100644
+--- a/tests/test_news_lookahead.py
++++ b/tests/test_news_lookahead.py
+@@ -244,14 +244,19 @@ def test_a_yahoo_news_outage_moves_to_the_next_configured_vendor(monkeypatch):
+         return "OTHER VENDOR NEWS"
+ 
+     saved = dict(get_config()["data_vendors"])
+-    set_config({"data_vendors": {**saved, "news_data": "yfinance,alpha_vantage"}})
++    saved_tools = dict(get_config()["tool_vendors"])
++    # get_news is selected in tool_vendors, which beats the news_data category.
++    set_config({
++        "data_vendors": {**saved, "news_data": "yfinance,alpha_vantage"},
++        "tool_vendors": {"get_news": "yfinance,alpha_vantage"},
++    })
+     try:
+         with patch.dict(router.VENDOR_METHODS, {"get_news": {
+             "yfinance": ynews.get_news_yfinance, "alpha_vantage": other_vendor,
+         }}):
+             out = router.route_to_vendor("get_news", "AAPL", "2026-10-01", "2026-10-02")
+     finally:
+-        set_config({"data_vendors": saved})
++        set_config({"data_vendors": saved, "tool_vendors": saved_tools})
+     assert out == "OTHER VENDOR NEWS" and len(calls) == 1
+ 
+ 
+diff --git a/tests/test_news_vendor_routing.py b/tests/test_news_vendor_routing.py
+new file mode 100644
+index 0000000..c1dd043
+--- /dev/null
++++ b/tests/test_news_vendor_routing.py
+@@ -0,0 +1,187 @@
++"""Default news routing uses Google News RSS, then AnySearch, and not Yahoo or Alpha Vantage."""
++
++from datetime import UTC, datetime
++
++import pytest
++
++from tradingagents.dataflows import router
++from tradingagents.dataflows.config import set_config
++from tradingagents.dataflows.errors import VendorUnavailableError
++from tradingagents.dataflows.news_support import clear_news_cache
++from tradingagents.dataflows.vendors.anysearch import news as anysearch
++from tradingagents.dataflows.vendors.google_news.news import get_news as get_google_news
++from tradingagents.default_config import DEFAULT_CONFIG
++
++
++@pytest.fixture(autouse=True)
++def _isolated(tmp_path):
++    clear_news_cache()
++    anysearch.clear_quota_backoff()
++    set_config({"data_cache_dir": str(tmp_path)})
++    yield
++    clear_news_cache()
++    anysearch.clear_quota_backoff()
++
++
++def _chain(monkeypatch, method, impls):
++    monkeypatch.setitem(router.VENDOR_METHODS, method, {
++        **router.VENDOR_METHODS[method],
++        **impls,
++    })
++
++
++@pytest.mark.unit
++def test_defaults_leave_prices_and_fundamentals_alone():
++    assert DEFAULT_CONFIG["tool_vendors"]["get_news"] == "google_news,anysearch"
++    assert DEFAULT_CONFIG["tool_vendors"]["get_global_news"] == "google_news,anysearch"
++    assert DEFAULT_CONFIG["data_vendors"]["news_data"] == "yfinance"
++    assert DEFAULT_CONFIG["data_vendors"]["fundamental_data"] == "sec_edgar,yfinance"
++    assert DEFAULT_CONFIG["data_vendors"]["core_stock_apis"] == "yfinance"
++    assert DEFAULT_CONFIG["data_vendors"]["technical_indicators"] == "yfinance"
++    assert "google_news" not in router.VENDOR_METHODS["get_insider_transactions"]
++    assert "anysearch" not in router.VENDOR_METHODS["get_insider_transactions"]
++    assert "google_news" not in router.VENDOR_METHODS["get_stock_data"]
++    assert "google_news" not in router.VENDOR_METHODS["get_fundamentals"]
++    # Yahoo's own macro query list is untouched so a local Yahoo news patch
++    # still sees the queries it was written against.
++    assert DEFAULT_CONFIG["global_news_queries"][0] == "Federal Reserve interest rates inflation"
++    assert "FOMC" in DEFAULT_CONFIG["news_macro_queries"][0]
++
++
++@pytest.mark.unit
++def test_rss_success_does_not_call_later_vendors(monkeypatch):
++    called = []
++
++    def rss(*args, **kwargs):
++        called.append("google_news")
++        return "RSS BODY"
++
++    def later(name):
++        def impl(*args, **kwargs):
++            called.append(name)
++            return name
++        return impl
++
++    _chain(monkeypatch, "get_news", {
++        "google_news": rss,
++        "anysearch": later("anysearch"),
++        "yfinance": later("yfinance"),
++        "alpha_vantage": later("alpha_vantage"),
++    })
++    assert router.route_to_vendor("get_news", "AMD", "2026-11-01", "2026-11-06") == "RSS BODY"
++    assert called == ["google_news"]
++
++
++@pytest.mark.unit
++def test_rss_outage_falls_back_to_anysearch_not_yahoo(monkeypatch):
++    called = []
++
++    def rss(*args, **kwargs):
++        called.append("google_news")
++        raise VendorUnavailableError("Google News RSS HTTP 503")
++
++    def search(*args, **kwargs):
++        called.append("anysearch")
++        return "ANY BODY"
++
++    def yahoo(*args, **kwargs):
++        called.append("yfinance")
++        return "YAHOO"
++
++    _chain(monkeypatch, "get_news", {
++        "google_news": rss,
++        "anysearch": search,
++        "yfinance": yahoo,
++        "alpha_vantage": yahoo,
++    })
++    assert router.route_to_vendor("get_news", "AMD", "2026-11-01", "2026-11-06") == "ANY BODY"
++    assert called == ["google_news", "anysearch"]
++
++
++@pytest.mark.unit
++def test_both_news_vendors_down_is_unavailable_not_an_exception(monkeypatch):
++    def down(*args, **kwargs):
++        raise VendorUnavailableError("down")
++
++    _chain(monkeypatch, "get_global_news", {
++        "google_news": down,
++        "anysearch": down,
++    })
++    out = router.route_to_vendor("get_global_news", "2026-11-06", 7, 5)
++    assert out.startswith("DATA_UNAVAILABLE")
++    assert "delisted" not in out
++
++
++@pytest.mark.unit
++def test_explicit_yahoo_chain_is_still_available(monkeypatch):
++    set_config({"tool_vendors": {"get_news": "yfinance"}})
++
++    def yahoo(*args, **kwargs):
++        return "YAHOO NEWS"
++
++    def rss(*args, **kwargs):
++        raise AssertionError("RSS must not run when the chain is Yahoo only")
++
++    _chain(monkeypatch, "get_news", {"yfinance": yahoo, "google_news": rss})
++    assert router.route_to_vendor("get_news", "AMD", "2026-11-01", "2026-11-06") == "YAHOO NEWS"
++
++
++@pytest.mark.unit
++def test_router_cache_and_secret_stay_inside_the_adapter(monkeypatch):
++    """A real RSS fetch is cached; a 402 fallback does not copy the key into the tool result."""
++    secret = "as-sk-test-DO_NOT_LEAK_router"
++    password = "password-DO_NOT_LEAK_router"
++    monkeypatch.setenv("ANYSEARCH_API_KEY", secret)
++    today = datetime.now(UTC).strftime("%Y-%m-%d")
++    xml = (
++        "<?xml version='1.0'?><rss version='2.0'><channel><item>"
++        "<title>Router AMD</title>"
++        "<link>https://news.google.com/rss/articles/router</link>"
++        f"<pubDate>{datetime.now(UTC).strftime('%a, %d %b %Y %H:%M:%S GMT')}</pubDate>"
++        "<source url='https://www.cnbc.com'>CNBC</source>"
++        "<description>snippet</description>"
++        "</item></channel></rss>"
++    )
++    calls = {"rss": 0, "any": 0}
++
++    def request(method, url, **kwargs):
++        if method == "GET":
++            calls["rss"] += 1
++            class Resp:
++                status_code = 200
++                content = xml.encode()
++                headers = {}
++            return Resp()
++        calls["any"] += 1
++        class Denied:
++            status_code = 402
++            headers = {"X-Request-ID": "req-router"}
++            content = f"password={password} api_key={secret}".encode()
++
++            def json(self):
++                raise AssertionError("402 body must not be parsed")
++        return Denied()
++
++    monkeypatch.setattr("tradingagents.dataflows.news_support.requests.request", request)
++    monkeypatch.setattr("tradingagents.dataflows.news_support._sleep", lambda seconds: None)
++    set_config({"news_anysearch_supplement": False, "news_http_max_retries": 0})
++
++    # Force the RSS adapter to fail so the router reaches AnySearch, then a
++    # second direct RSS call proves the cache is separate from that failure.
++    def broken_rss(*args, **kwargs):
++        raise VendorUnavailableError("Google News RSS HTTP 503")
++
++    _chain(monkeypatch, "get_news", {"google_news": broken_rss})
++    failed = router.route_to_vendor("get_news", "AMD", today, today)
++    assert failed.startswith("DATA_UNAVAILABLE")
++    assert secret not in failed and password not in failed
++    assert calls["any"] == 1
++
++    # Restore the real RSS vendor and fetch twice: one HTTP GET, then cache.
++    monkeypatch.setitem(router.VENDOR_METHODS["get_news"], "google_news", get_google_news)
++    # The previous 402 armed AnySearch backoff. RSS must still answer.
++    first = router.route_to_vendor("get_news", "AMD", today, today)
++    second = router.route_to_vendor("get_news", "AMD", today, today)
++    assert "Router AMD" in first and first == second
++    assert calls["rss"] == 1
++    assert secret not in first
+diff --git a/tests/test_yahoo_rate_limit.py b/tests/test_yahoo_rate_limit.py
+index 29d3b14..0a62907 100644
+--- a/tests/test_yahoo_rate_limit.py
++++ b/tests/test_yahoo_rate_limit.py
+@@ -51,6 +51,11 @@ def yahoo(monkeypatch, tmp_path):
+     pytest.param(get_insider_transactions, ("AAPL",), id="insider"),
+ ])
+ def test_a_rate_limit_that_outlasts_the_retries_is_reported_as_one(yahoo, tool, args):
++    # News tools default to Google News RSS. Pin Yahoo so this still tests the
++    # Yahoo rate-limit path the tool used to take first.
++    set_config({
++        "tool_vendors": {"get_news": "yfinance", "get_global_news": "yfinance"},
++    })
+     for name in ("history", "get_news"):
+         yahoo.setattr(yf.Ticker, name, _rate_limited)
+     yahoo.setattr(yf.Ticker, "insider_transactions", property(_rate_limited))
+diff --git a/tradingagents/dataflows/news_support.py b/tradingagents/dataflows/news_support.py
+new file mode 100644
+index 0000000..1be1e67
+--- /dev/null
++++ b/tradingagents/dataflows/news_support.py
+@@ -0,0 +1,401 @@
++"""Shared news-vendor helpers: dates, dedup, cache, bounded HTTP, and report text.
++
++Google News RSS and AnySearch both speak through these helpers so a publication
++time is either taken from the source or left unknown. Nothing here invents a
++date, and a cached payload never includes an API key.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import re
++import threading
++import time
++import urllib.parse
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from email.utils import parsedate_to_datetime
++from pathlib import Path
++
++import requests
++
++from tradingagents.dataflows.config import get_config
++from tradingagents.dataflows.errors import VendorUnavailableError
++
++logger = logging.getLogger(__name__)
++
++USER_AGENT = "tradingagents/0.7.1 (+https://github.com/Familymansam/TradingAgents; personal news reader)"
++MAX_RESPONSE_BYTES = 5 * 1024 * 1024
++_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
++_memory: dict[str, tuple[float, str]] = {}
++_lock = threading.Lock()
++
++# Topic-constrained macro queries. Google News receives every query with an
++# after:/before: window. AnySearch uses the first ``anysearch_macro_query_limit``
++# of them as the query text on finance.news type=general (the documented
++# "global English financial news" constraint). Yahoo keeps its own
++# ``global_news_queries`` list.
++DEFAULT_MACRO_QUERIES = (
++    '(Federal Reserve OR FOMC) ("interest rate" OR inflation OR "monetary policy")',
++    '("stock market" OR "S&P 500") (earnings OR GDP OR "economic outlook")',
++    '(tariff OR sanctions OR "trade war") (market OR economy OR stocks)',
++    '(ECB OR "Bank of England" OR "Bank of Japan") ("central bank" OR "interest rate")',
++    '(oil OR crude OR OPEC) (price OR supply OR energy) (market OR economy)',
++)
++
++
++@dataclass
++class NewsItem:
++    """One headline. ``published_at`` is UTC when the source gave a time, else None."""
++
++    title: str
++    url: str
++    publisher: str
++    snippet: str
++    published_at: datetime | None
++    attribution: str
++    publisher_site: str = ""
++
++
++def redact(text: str, secret: str = "") -> str:
++    """Drop a secret and any Bearer token from text that might be logged."""
++    if not text:
++        return ""
++    cleaned = text
++    if secret:
++        cleaned = cleaned.replace(secret, "***")
++    return re.sub(r"Bearer\s+\S+", "Bearer ***", cleaned)
++
++
++def clear_news_cache() -> None:
++    """Drop the in-process news cache. File entries expire by their own TTL."""
++    with _lock:
++        _memory.clear()
++
++
++def _sleep(seconds: float) -> None:
++    """Indirection so tests can skip the backoff wait."""
++    if seconds > 0:
++        time.sleep(seconds)
++
++
++def _cache_ttl() -> float:
++    try:
++        return max(0.0, float(get_config().get("news_cache_ttl_seconds", 900)))
++    except (TypeError, ValueError):
++        return 900.0
++
++
++def _cache_path(key: str) -> Path:
++    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
++    root = Path(get_config().get("data_cache_dir") or ".") / "news"
++    return root / digest[:2] / f"{digest}.json"
++
++
++def cache_get(key: str) -> str | None:
++    """Return a cached payload, or None when the entry is missing or stale."""
++    ttl = _cache_ttl()
++    now = time.time()
++    with _lock:
++        hit = _memory.get(key)
++        if hit is not None and now - hit[0] < ttl:
++            return hit[1]
++    path = _cache_path(key)
++    try:
++        if path.exists() and now - path.stat().st_mtime < ttl:
++            text = path.read_text(encoding="utf-8")
++        else:
++            return None
++    except OSError:
++        return None
++    with _lock:
++        _memory[key] = (now, text)
++    return text
++
++
++def cache_set(key: str, text: str) -> None:
++    """Remember a successful public payload. Callers must not pass secrets."""
++    now = time.time()
++    with _lock:
++        _memory[key] = (now, text)
++    path = _cache_path(key)
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(text, encoding="utf-8")
++    except OSError as exc:
++        logger.warning("News cache write failed: %s", type(exc).__name__)
++
++
++def http_request(
++    method: str,
++    url: str,
++    *,
++    params: dict | None = None,
++    json_body: dict | None = None,
++    headers: dict | None = None,
++    timeout: float,
++    max_retries: int,
++    secret: str = "",
++) -> requests.Response:
++    """One HTTP call with a bounded retry on transport errors, 429, and 5xx.
++
++    The response is returned even when the status is an error, so the caller
++    can decide what it means. Error bodies are not logged: an AnySearch 402
++    can contain a generated key. ``secret``, when passed, is stripped from the
++    transport-error message.
++    """
++    attempts = max(0, int(max_retries)) + 1
++    host = urllib.parse.urlparse(url).netloc
++    last_transport: str | None = None
++    for attempt in range(attempts):
++        try:
++            response = requests.request(
++                method,
++                url,
++                params=params,
++                json=json_body,
++                headers=headers,
++                timeout=timeout,
++            )
++        except requests.RequestException as exc:
++            last_transport = redact(f"{type(exc).__name__}: {exc}", secret)
++            logger.warning(
++                "News HTTP %s %s transport failure (attempt %s/%s)",
++                method, host, attempt + 1, attempts,
++            )
++            if attempt + 1 < attempts:
++                _sleep(min(8.0, 0.4 * (2 ** attempt)))
++                continue
++            raise VendorUnavailableError(f"HTTP request failed: {last_transport}") from None
++        if response.status_code in _RETRY_STATUSES and attempt + 1 < attempts:
++            wait = _retry_after_seconds(response.headers)
++            if wait is None:
++                wait = min(8.0, 0.4 * (2 ** attempt))
++            logger.warning(
++                "News HTTP %s %s status %s; retrying in %.1fs (attempt %s/%s)",
++                method, host, response.status_code, wait, attempt + 1, attempts,
++            )
++            _sleep(wait)
++            continue
++        if response.status_code < 400 and len(response.content) > MAX_RESPONSE_BYTES:
++            raise VendorUnavailableError(
++                f"HTTP response from {host} exceeded {MAX_RESPONSE_BYTES} bytes"
++            )
++        return response
++    raise VendorUnavailableError(f"HTTP request failed: {last_transport or host}")
++
++
++def _retry_after_seconds(headers) -> float | None:
++    """Seconds from a Retry-After header, capped at 8 so a run does not stall.
++
++    Returns None when the header is missing or not a delay in seconds (HTTP-date
++    values are left to the caller's own short backoff). A valid ``0`` stays 0.
++    """
++    try:
++        raw = headers.get("Retry-After") if headers else None
++        return min(float(raw), 8.0) if raw is not None else None
++    except (TypeError, ValueError, AttributeError):
++        return None
++
++
++def http_timeout() -> float:
++    try:
++        return max(1.0, float(get_config().get("news_http_timeout_seconds", 12)))
++    except (TypeError, ValueError):
++        return 12.0
++
++
++def http_retries() -> int:
++    try:
++        return max(0, int(get_config().get("news_http_max_retries", 1)))
++    except (TypeError, ValueError):
++        return 1
++
++
++def snippet_chars() -> int:
++    try:
++        return max(80, int(get_config().get("news_snippet_chars", 480)))
++    except (TypeError, ValueError):
++        return 480
++
++
++def macro_queries() -> list[str]:
++    configured = get_config().get("news_macro_queries")
++    if isinstance(configured, (list, tuple)) and configured:
++        return [str(q).strip() for q in configured if str(q).strip()]
++    return list(DEFAULT_MACRO_QUERIES)
++
++
++def parse_http_date(value) -> datetime | None:
++    """RFC 822 / ISO-8601 to UTC, or None when the value is missing or unusable.
++
++    A naive ISO value is read as UTC. This never guesses a date from a headline.
++    """
++    if value is None:
++        return None
++    text = str(value).strip()
++    if not text:
++        return None
++    parsed = _parse_rfc822(text)
++    if parsed is None:
++        parsed = _parse_iso(text)
++    if parsed is None:
++        return None
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=UTC)
++    return parsed.astimezone(UTC)
++
++
++def _parse_rfc822(text: str) -> datetime | None:
++    try:
++        return parsedate_to_datetime(text)
++    except (TypeError, ValueError, IndexError, OverflowError):
++        return None
++
++
++def _parse_iso(text: str) -> datetime | None:
++    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
++    try:
++        return datetime.fromisoformat(candidate)
++    except ValueError:
++        return None
++
++
++def http_url(value: str) -> str:
++    """An http(s) URL, or "" when the value is not one."""
++    if not value:
++        return ""
++    parsed = urllib.parse.urlparse(value.strip())
++    if parsed.scheme in {"http", "https"} and parsed.netloc:
++        return value.strip()
++    return ""
++
++
++def publisher_host(url: str) -> str:
++    host = urllib.parse.urlparse(url).hostname or ""
++    if host.startswith("www."):
++        host = host[4:]
++    return host
++
++
++def dedup(items: list[NewsItem]) -> list[NewsItem]:
++    """Drop later items with the same URL, or the same title and publisher."""
++    seen: set[tuple[str, ...]] = set()
++    kept: list[NewsItem] = []
++    for item in items:
++        url = item.url.split("#", 1)[0].rstrip("/").lower()
++        title = " ".join(item.title.lower().split())
++        publisher = item.publisher.lower()
++        ident = ("u", url) if url else ("t", title, publisher)
++        if ident in seen:
++            continue
++        seen.add(ident)
++        kept.append(item)
++    return kept
++
++
++def cap_items(items: list[NewsItem], limit: int) -> list[NewsItem]:
++    """Newest dated items first, then undated items, up to ``limit``."""
++    dated = sorted(
++        (item for item in items if item.published_at is not None),
++        key=lambda item: item.published_at,
++        reverse=True,
++    )
++    undated = [item for item in items if item.published_at is None]
++    return (dated + undated)[: max(0, limit)]
++
++
++def render_news(heading: str, items: list[NewsItem]) -> str:
++    """A prompt block that keeps known and unknown publication times apart."""
++    dated = [item for item in items if item.published_at is not None]
++    undated = [item for item in items if item.published_at is None]
++    note = (
++        "Headlines and snippets only, not full text. A publication time is printed "
++        "only when that source provided one; dates are not inferred from the headline. "
++        "Undated AnySearch rows are live search hits and are not historical validated evidence."
++    )
++    parts = [
++        heading,
++        note,
++        f"Dated items: {len(dated)}. Undated items: {len(undated)}.",
++    ]
++    if dated:
++        parts.append("Dated items (publication time known):\n\n" + _blocks(dated))
++    if undated:
++        parts.append(
++            "Undated items (publication time unknown; not historical validated evidence):\n\n"
++            + _blocks(undated)
++        )
++    return "\n\n".join(parts).rstrip() + "\n"
++
++
++def _blocks(items: list[NewsItem]) -> str:
++    limit = snippet_chars()
++    blocks = []
++    for item in items:
++        if item.published_at is None:
++            published = (
++                "Published: unknown (publication time was not provided; "
++                "not historical validated evidence)"
++            )
++        else:
++            published = (
++                "Published: "
++                + item.published_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
++                + " (publication time known)"
++            )
++        snippet = " ".join((item.snippet or "").split())
++        if len(snippet) > limit:
++            snippet = snippet[: limit - 1].rstrip() + "…"
++        lines = [
++            f"### {item.title}",
++            f"Publisher: {item.publisher or 'unknown'}",
++            published,
++            "Form: headline and snippet only, not the full article.",
++            f"Attribution: {item.attribution}",
++            f"Snippet: {snippet or 'unavailable'}",
++            f"Link: {item.url or 'unavailable'}",
++        ]
++        if item.publisher_site:
++            lines.append(f"Publisher site: {item.publisher_site}")
++        blocks.append("\n".join(lines))
++    return "\n\n".join(blocks)
++
++
++def dump_items(items: list[NewsItem]) -> str:
++    return json.dumps(
++        [
++            {
++                "title": item.title,
++                "url": item.url,
++                "publisher": item.publisher,
++                "snippet": item.snippet,
++                "published_at": item.published_at.isoformat() if item.published_at else None,
++                "attribution": item.attribution,
++                "publisher_site": item.publisher_site,
++            }
++            for item in items
++        ],
++        ensure_ascii=False,
++    )
++
++
++def load_items(payload: str) -> list[NewsItem]:
++    raw = json.loads(payload)
++    items = []
++    for row in raw:
++        published = parse_http_date(row.get("published_at"))
++        items.append(
++            NewsItem(
++                title=row.get("title") or "",
++                url=row.get("url") or "",
++                publisher=row.get("publisher") or "",
++                snippet=row.get("snippet") or "",
++                published_at=published,
++                attribution=row.get("attribution") or "",
++                publisher_site=row.get("publisher_site") or "",
++            )
++        )
++    return items
+diff --git a/tradingagents/dataflows/router.py b/tradingagents/dataflows/router.py
+index b047e76..9db0280 100644
+--- a/tradingagents/dataflows/router.py
++++ b/tradingagents/dataflows/router.py
+@@ -17,7 +17,15 @@ from tradingagents.dataflows.vendors.alpha_vantage import (
+     get_news as get_alpha_vantage_news,
+     get_stock as get_alpha_vantage_stock,
+ )
++from tradingagents.dataflows.vendors.anysearch.news import (
++    get_global_news as get_anysearch_global_news,
++    get_news as get_anysearch_news,
++)
+ from tradingagents.dataflows.vendors.fred import get_macro_data as get_fred_macro_data
++from tradingagents.dataflows.vendors.google_news.news import (
++    get_global_news as get_google_global_news,
++    get_news as get_google_news,
++)
+ from tradingagents.dataflows.vendors.polymarket import (
+     get_prediction_markets as get_polymarket_prediction_markets,
+ )
+@@ -125,12 +133,18 @@ VENDOR_METHODS = {
+         "sec_edgar": get_sec_edgar_income_statement,
+         "yfinance": get_yfinance_income_statement,
+     },
+-    # news_data
++    # news_data. google_news is the dated RSS source. anysearch is the live
++    # undated supplement/fallback. yfinance and alpha_vantage stay available
++    # when a chain names them; they are not the default for these two tools.
+     "get_news": {
+-        "alpha_vantage": get_alpha_vantage_news,
++        "google_news": get_google_news,
++        "anysearch": get_anysearch_news,
+         "yfinance": get_news_yfinance,
++        "alpha_vantage": get_alpha_vantage_news,
+     },
+     "get_global_news": {
++        "google_news": get_google_global_news,
++        "anysearch": get_anysearch_global_news,
+         "yfinance": get_global_news_yfinance,
+         "alpha_vantage": get_alpha_vantage_global_news,
+     },
+diff --git a/tradingagents/dataflows/vendors/anysearch/__init__.py b/tradingagents/dataflows/vendors/anysearch/__init__.py
+new file mode 100644
+index 0000000..f613c3b
+--- /dev/null
++++ b/tradingagents/dataflows/vendors/anysearch/__init__.py
+@@ -0,0 +1,5 @@
++"""AnySearch finance.news: live headline/snippet fallback. No reliable publication time."""
++
++from tradingagents.dataflows.vendors.anysearch.news import get_global_news, get_news
++
++__all__ = ["get_global_news", "get_news"]
+diff --git a/tradingagents/dataflows/vendors/anysearch/news.py b/tradingagents/dataflows/vendors/anysearch/news.py
+new file mode 100644
+index 0000000..12f3c3b
+--- /dev/null
++++ b/tradingagents/dataflows/vendors/anysearch/news.py
+@@ -0,0 +1,348 @@
++"""AnySearch ``finance.news`` for ticker and macro headlines.
++
++Official contract (https://www.anysearch.com/docs/api-endpoints/v1-search and the
++finance capability catalog): ``POST /v1/search`` with ``Authorization: Bearer``
++from ``ANYSEARCH_API_KEY``. ``finance.news`` requires ``params.type``:
++
++- ``stock`` — international single-stock news; ``symbol`` is the ticker
++- ``general`` — global English financial news
++
++``period`` is a live lookback (``7d``, ``14d``, or a custom ``{N}d``), the same
++values as ``finance.quote``. It is not a historical as-of window. The success
++payload's documented fields are ``title``, ``url``, ``snippet``, and ``content``.
++There is no reliable ``published_at``. ``content`` is not copied into the report:
++the analyst sees the headline, the snippet, and the link.
++
++Undated rows are withheld for a window that does not reach the present. They
++are not historical validated evidence, and this module does not call the API
++for those windows (a live result would be later than the analysis date).
++
++HTTP 402 and 429 back off without reading the body into a log. A 402 message
++can contain a generated key. Diagnostics keep the status and ``X-Request-ID``.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import threading
++import time
++from datetime import datetime, timedelta
++
++from tradingagents.dataflows.config import get_config
++from tradingagents.dataflows.date_window import in_window
++from tradingagents.dataflows.errors import VendorNotConfiguredError, VendorUnavailableError
++from tradingagents.dataflows.news_support import (
++    USER_AGENT,
++    NewsItem,
++    cache_get,
++    cache_set,
++    cap_items,
++    dedup,
++    http_request,
++    http_retries,
++    http_timeout,
++    http_url,
++    publisher_host,
++    render_news,
++)
++
++logger = logging.getLogger(__name__)
++
++_SEARCH_PATH = "/v1/search"
++_SYMBOL = re.compile(r"[A-Z0-9.\-]{1,15}")
++_DATE_FIELDS = ("published_at", "publishedAt", "pub_date", "pubDate", "published", "date")
++_backoff_until = 0.0
++_backoff_lock = threading.Lock()
++
++
++def clear_quota_backoff() -> None:
++    """Forget a quota backoff. Tests call this so one case cannot block the next."""
++    global _backoff_until
++    with _backoff_lock:
++        _backoff_until = 0.0
++
++
++def search_ticker(ticker: str, start_date: str, end_date: str) -> list[NewsItem]:
++    """Live ``finance.news`` rows for ``ticker``, or an error when none can be used."""
++    _require_live(start_date, end_date)
++    symbol = _symbol(ticker)
++    rows = _search(
++        query=f"{symbol} stock news",
++        params={"type": "stock", "symbol": symbol, "period": _period(start_date, end_date)},
++        limit=_max_results(get_config().get("news_article_limit", 10)),
++        attribution=f"AnySearch finance.news type=stock symbol={symbol}",
++    )
++    return _usable(rows, start_date, end_date)
++
++
++def search_macro(as_of_date: str, look_back_days: int, limit: int) -> list[NewsItem]:
++    """Live ``finance.news`` ``type=general`` rows for the configured macro topics."""
++    start_dt = datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=int(look_back_days))
++    start_date = start_dt.strftime("%Y-%m-%d")
++    _require_live(start_date, as_of_date)
++    topics = _macro_topics()
++    found: list[NewsItem] = []
++    capped = _max_results(limit)
++    for topic in topics:
++        found.extend(
++            _search(
++                query=topic,
++                params={"type": "general", "period": _period(start_date, as_of_date)},
++                limit=capped,
++                attribution="AnySearch finance.news type=general",
++            )
++        )
++        if len(_usable(dedup(found), start_date, as_of_date)) >= capped:
++            break
++    return _usable(dedup(found), start_date, as_of_date)
++
++
++def get_news(ticker: str, start_date: str, end_date: str) -> str:
++    """Router entry. Empty and historical calls are unavailable, not 'no news'."""
++    items = search_ticker(ticker, start_date, end_date)
++    if not items:
++        raise VendorUnavailableError("AnySearch returned no usable news items")
++    limit = int(get_config().get("news_article_limit", 10))
++    return render_news(
++        f"## {ticker} News, from {start_date} to {end_date}:",
++        cap_items(items, limit),
++    )
++
++
++def get_global_news(
++    as_of_date: str,
++    look_back_days: int | None = None,
++    limit: int | None = None,
++) -> str:
++    """Router entry for macro headlines. Same live-only rule as ``get_news``."""
++    config = get_config()
++    if look_back_days is None:
++        look_back_days = int(config.get("global_news_lookback_days", 7))
++    if limit is None:
++        limit = int(config.get("global_news_article_limit", 10))
++    start_date = (
++        datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=int(look_back_days))
++    ).strftime("%Y-%m-%d")
++    items = search_macro(as_of_date, int(look_back_days), int(limit))
++    if not items:
++        raise VendorUnavailableError("AnySearch returned no usable macro news items")
++    return render_news(
++        f"## Global Market News, from {start_date} to {as_of_date}:",
++        cap_items(items, int(limit)),
++    )
++
++
++def _require_live(start_date: str, end_date: str) -> None:
++    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
++    if in_window(None, end_dt, end_dt):
++        return
++    raise VendorUnavailableError(
++        "AnySearch publication times are not reliable, so undated results are withheld "
++        f"for {start_date}..{end_date} and are not historical validated evidence"
++    )
++
++
++def _usable(items: list[NewsItem], start_date: str, end_date: str) -> list[NewsItem]:
++    """Keep known dates inside the window. Keep unknown dates only while it is live."""
++    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
++    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
++    return [item for item in items if in_window(item.published_at, start_dt, end_dt)]
++
++
++def _macro_topics() -> list[str]:
++    from tradingagents.dataflows.news_support import macro_queries
++
++    try:
++        count = int(get_config().get("anysearch_macro_query_limit", 2))
++    except (TypeError, ValueError):
++        count = 2
++    topics = macro_queries()[: max(1, count)]
++    if not topics:
++        raise VendorUnavailableError("no macro news topics are configured")
++    return topics
++
++
++def _search(*, query: str, params: dict, limit: int, attribution: str) -> list[NewsItem]:
++    language = (get_config().get("anysearch_language") or "").strip()
++    zone = (get_config().get("anysearch_zone") or "").strip()
++    payload = {"query": query, "tag": "finance.news", "params": params, "max_results": limit}
++    if language:
++        payload["language"] = language
++    if zone:
++        payload["zone"] = zone
++    cache_key = "anysearch:" + json.dumps(payload, sort_keys=True, ensure_ascii=False)
++    cached = cache_get(cache_key)
++    if cached is not None:
++        try:
++            return _items_from_results(json.loads(cached), attribution)
++        except (ValueError, TypeError):
++            logger.warning("Ignoring an unreadable AnySearch cache entry")
++    body = _post(payload)
++    results = _results(body)
++    secret = os.environ.get("ANYSEARCH_API_KEY", "").strip()
++    serialized = json.dumps(results, ensure_ascii=False)
++    if secret and secret in serialized:
++        logger.warning("AnySearch payload echoed the API key; the result was not cached")
++    else:
++        cache_set(cache_key, serialized)
++    return _items_from_results(results, attribution)
++
++
++def _post(payload: dict) -> dict:
++    remaining = _backoff_remaining()
++    if remaining > 0:
++        raise VendorUnavailableError(
++            f"AnySearch quota backoff active for {remaining:.0f}s"
++        )
++    key = _api_key()
++    base = (get_config().get("anysearch_base_url") or "https://api.anysearch.com").rstrip("/")
++    response = http_request(
++        "POST",
++        base + _SEARCH_PATH,
++        json_body=payload,
++        headers={
++            "Authorization": f"Bearer {key}",
++            "Content-Type": "application/json",
++            "Accept": "application/json",
++            "User-Agent": USER_AGENT,
++        },
++        timeout=http_timeout(),
++        max_retries=http_retries(),
++        secret=key,
++    )
++    request_id = response.headers.get("X-Request-ID") or "unknown"
++    status = response.status_code
++    if status in {402, 429}:
++        _arm_backoff(status, response.headers)
++        raise VendorUnavailableError(f"AnySearch HTTP {status}; request_id={request_id}")
++    if status in {401, 403}:
++        raise VendorNotConfiguredError(
++            f"AnySearch auth failed HTTP {status}; request_id={request_id}"
++        )
++    if status != 200:
++        raise VendorUnavailableError(f"AnySearch HTTP {status}; request_id={request_id}")
++    try:
++        body = response.json()
++    except ValueError:
++        raise VendorUnavailableError(
++            f"AnySearch response was not JSON; request_id={request_id}"
++        ) from None
++    if not isinstance(body, dict) or body.get("code") != 0:
++        code = body.get("code") if isinstance(body, dict) else "invalid"
++        raise VendorUnavailableError(f"AnySearch code {code}; request_id={request_id}")
++    return body
++
++
++def _results(body: dict) -> list:
++    data = body.get("data")
++    results = data.get("results") if isinstance(data, dict) else None
++    if not isinstance(results, list):
++        raise VendorUnavailableError("AnySearch response had no results array")
++    return results
++
++
++def _items_from_results(results: list, attribution: str) -> list[NewsItem]:
++    items = []
++    for row in results:
++        if not isinstance(row, dict):
++            continue
++        title = " ".join(str(row.get("title") or "").split())
++        url = http_url(str(row.get("url") or ""))
++        if not title and not url:
++            continue
++        # ``content`` is intentionally unused: it is cleaned page text, not a
++        # dated article, and the report is headline/snippet only.
++        snippet = " ".join(str(row.get("snippet") or "").split())
++        items.append(
++            NewsItem(
++                title=title or "untitled",
++                url=url,
++                publisher=publisher_host(url) or "AnySearch",
++                snippet=snippet,
++                published_at=_published_at(row),
++                attribution=attribution,
++            )
++        )
++    return items
++
++
++def _published_at(row: dict):
++    """A documented-or-present timestamp field, or None. Never a date from the snippet."""
++    from tradingagents.dataflows.news_support import parse_http_date
++
++    for field in _DATE_FIELDS:
++        if field not in row or row[field] in (None, ""):
++            continue
++        return parse_http_date(row[field])
++    return None
++
++
++def _api_key() -> str:
++    key = os.environ.get("ANYSEARCH_API_KEY", "").strip()
++    if not key:
++        raise VendorNotConfiguredError(
++            "ANYSEARCH_API_KEY is not set; AnySearch news is not configured"
++        )
++    return key
++
++
++def _symbol(ticker: str) -> str:
++    if not isinstance(ticker, str):
++        raise VendorUnavailableError("ticker is not a usable AnySearch stock symbol")
++    candidate = ticker.strip().upper()
++    if _SYMBOL.fullmatch(candidate):
++        return candidate
++    raise VendorUnavailableError("ticker is not a usable AnySearch stock symbol")
++
++
++def _period(start_date: str, end_date: str) -> str:
++    """Live lookback ``{N}d``, capped. This is not an as-of historical filter."""
++    start = datetime.strptime(start_date, "%Y-%m-%d")
++    end = datetime.strptime(end_date, "%Y-%m-%d")
++    days = max(1, (end - start).days + 1)
++    try:
++        cap = int(get_config().get("anysearch_max_period_days", 14))
++    except (TypeError, ValueError):
++        cap = 14
++    return f"{max(1, min(days, max(1, cap)))}d"
++
++
++def _max_results(limit) -> int:
++    """AnySearch accepts 1–10. Callers asking for more are clamped, not rejected."""
++    try:
++        asked = int(limit)
++    except (TypeError, ValueError):
++        asked = 10
++    try:
++        ceiling = int(get_config().get("anysearch_max_results", 10))
++    except (TypeError, ValueError):
++        ceiling = 10
++    return max(1, min(asked, ceiling, 10))
++
++
++def _backoff_remaining() -> float:
++    with _backoff_lock:
++        return max(0.0, _backoff_until - time.monotonic())
++
++
++def _arm_backoff(status: int, headers) -> None:
++    """Hold further calls after quota (402) or a rate limit that outlasted the retry."""
++    wait = None
++    try:
++        raw = headers.get("Retry-After") if headers else None
++        wait = float(raw) if raw is not None else None
++    except (TypeError, ValueError, AttributeError):
++        wait = None
++    if status == 402 or wait is None:
++        try:
++            wait = float(get_config().get("anysearch_quota_backoff_seconds", 60))
++        except (TypeError, ValueError):
++            wait = 60.0
++    wait = min(max(wait, 0.0), 120.0)
++    global _backoff_until
++    with _backoff_lock:
++        _backoff_until = max(_backoff_until, time.monotonic() + wait)
++    logger.warning("AnySearch HTTP %s; backing off for %.0fs", status, wait)
+diff --git a/tradingagents/dataflows/vendors/google_news/__init__.py b/tradingagents/dataflows/vendors/google_news/__init__.py
+new file mode 100644
+index 0000000..bc17c70
+--- /dev/null
++++ b/tradingagents/dataflows/vendors/google_news/__init__.py
+@@ -0,0 +1,5 @@
++"""Google News RSS: dated headlines for ticker and macro news."""
++
++from tradingagents.dataflows.vendors.google_news.news import get_global_news, get_news
++
++__all__ = ["get_global_news", "get_news"]
+diff --git a/tradingagents/dataflows/vendors/google_news/news.py b/tradingagents/dataflows/vendors/google_news/news.py
+new file mode 100644
+index 0000000..cec9149
+--- /dev/null
++++ b/tradingagents/dataflows/vendors/google_news/news.py
+@@ -0,0 +1,301 @@
++"""Google News RSS headlines for ``get_news`` and ``get_global_news``.
++
++The public search feed is RSS 2.0. Each item carries ``title``, ``link``,
++``pubDate``, and ``source``. ``pubDate`` is the publication time used for the
++window. An item with no parseable ``pubDate`` is undated: kept only when the
++window reaches the present, and never described as a known date.
++
++The feed is a recent sample, not an archive. A window it does not reach is
++reported as unavailable rather than as an absence of news. AnySearch, when
++configured, is appended only for a window that reaches today; its rows stay
++undated and are not treated as historical evidence. A transport or parse
++failure raises ``VendorUnavailableError`` so the router can try the next vendor.
++"""
++
++from __future__ import annotations
++
++import html
++import logging
++import re
++import urllib.parse
++import xml.etree.ElementTree as ET
++from datetime import datetime, timedelta
++
++from tradingagents.dataflows.config import get_config
++from tradingagents.dataflows.date_window import coverage_gap, in_window
++from tradingagents.dataflows.errors import VendorError, VendorUnavailableError
++from tradingagents.dataflows.news_support import (
++    USER_AGENT,
++    NewsItem,
++    cache_get,
++    cache_set,
++    cap_items,
++    dedup,
++    dump_items,
++    http_request,
++    http_retries,
++    http_timeout,
++    http_url,
++    load_items,
++    macro_queries,
++    parse_http_date,
++    render_news,
++)
++
++logger = logging.getLogger(__name__)
++
++RSS_URL = "https://news.google.com/rss/search"
++_SYMBOL = re.compile(r"[A-Za-z0-9._^=+\-]{1,32}")
++_TAG = re.compile(r"<[^>]+>")
++
++
++def get_news(ticker: str, start_date: str, end_date: str) -> str:
++    """Headlines for ``ticker`` in ``[start_date, end_date]``, Google News first."""
++    symbol = _news_symbol(ticker)
++    items = _search(_ticker_query(symbol, start_date, end_date))
++    return _report(
++        items,
++        start_date,
++        end_date,
++        heading=f"## {ticker} News, from {start_date} to {end_date}:",
++        subject=f"news for {ticker}",
++        limit=int(get_config().get("news_article_limit", 20)),
++        supplement=_supplement_ticker(ticker, start_date, end_date),
++    )
++
++
++def get_global_news(
++    as_of_date: str,
++    look_back_days: int | None = None,
++    limit: int | None = None,
++) -> str:
++    """Macro headlines in the lookback ending on ``as_of_date``."""
++    config = get_config()
++    if look_back_days is None:
++        look_back_days = int(config.get("global_news_lookback_days", 7))
++    if limit is None:
++        limit = int(config.get("global_news_article_limit", 10))
++    start_dt = datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=int(look_back_days))
++    start_date = start_dt.strftime("%Y-%m-%d")
++    found: list[NewsItem] = []
++    for topic in macro_queries():
++        found.extend(_search(_macro_query(topic, start_date, as_of_date)))
++        kept = _in_window(dedup(found), start_date, as_of_date)
++        if len(kept) >= limit:
++            break
++    return _report(
++        found,
++        start_date,
++        as_of_date,
++        heading=f"## Global Market News, from {start_date} to {as_of_date}:",
++        subject="market news",
++        limit=limit,
++        supplement=_supplement_macro(as_of_date, int(look_back_days), limit),
++    )
++
++
++def _report(
++    fetched: list[NewsItem],
++    start_date: str,
++    end_date: str,
++    *,
++    heading: str,
++    subject: str,
++    limit: int,
++    supplement: list[NewsItem],
++) -> str:
++    in_range = _in_window(dedup(fetched), start_date, end_date)
++    extra = _new_items(supplement, in_range)
++    chosen = cap_items(in_range + extra, limit)
++    if chosen:
++        return render_news(heading, chosen)
++    dates = [item.published_at for item in fetched if item.published_at is not None]
++    gap = coverage_gap(dates, start_date, end_date, "Google News RSS", subject)
++    return gap or f"No news found between {start_date} and {end_date}"
++
++
++def _in_window(items: list[NewsItem], start_date: str, end_date: str) -> list[NewsItem]:
++    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
++    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
++    return [item for item in items if in_window(item.published_at, start_dt, end_dt)]
++
++
++def _new_items(extra: list[NewsItem], have: list[NewsItem]) -> list[NewsItem]:
++    """Supplemental rows whose URL or title is not already in the RSS sample."""
++    seen_urls = {item.url.split("#", 1)[0].rstrip("/").lower() for item in have if item.url}
++    seen_titles = {" ".join(item.title.lower().split()) for item in have}
++    fresh = []
++    for item in extra:
++        url = item.url.split("#", 1)[0].rstrip("/").lower()
++        title = " ".join(item.title.lower().split())
++        if (url and url in seen_urls) or title in seen_titles:
++            continue
++        fresh.append(item)
++    return fresh
++
++
++def _supplement_ticker(ticker: str, start_date: str, end_date: str) -> list[NewsItem]:
++    if not _supplement_enabled(end_date):
++        return []
++    from tradingagents.dataflows.vendors.anysearch.news import search_ticker
++
++    return _supplement(lambda: search_ticker(ticker, start_date, end_date))
++
++
++def _supplement_macro(as_of_date: str, look_back_days: int, limit: int) -> list[NewsItem]:
++    if not _supplement_enabled(as_of_date):
++        return []
++    from tradingagents.dataflows.vendors.anysearch.news import search_macro
++
++    return _supplement(lambda: search_macro(as_of_date, look_back_days, limit))
++
++
++def _supplement_enabled(end_date: str) -> bool:
++    """AnySearch is live-only. A past window cannot be validated without a date."""
++    if not get_config().get("news_anysearch_supplement", True):
++        return False
++    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
++    return in_window(None, end_dt, end_dt)
++
++
++def _supplement(fetch) -> list[NewsItem]:
++    try:
++        return fetch()
++    except VendorError as exc:
++        logger.warning("AnySearch supplement unavailable: %s", type(exc).__name__)
++        return []
++
++
++def _news_symbol(ticker: str) -> str:
++    if not isinstance(ticker, str) or not _SYMBOL.fullmatch(ticker.strip()):
++        raise VendorUnavailableError("ticker is not a usable news symbol")
++    return ticker.strip().upper()
++
++
++def _ticker_query(symbol: str, start_date: str, end_date: str) -> str:
++    # before: is the day after end_date so the end date itself can match.
++    # pubDate filtering is what actually enforces the window.
++    before = _day_after(end_date)
++    return (
++        f'"{symbol}" (stock OR shares OR earnings OR company) '
++        f"after:{start_date} before:{before}"
++    )
++
++
++def _macro_query(topic: str, start_date: str, end_date: str) -> str:
++    # Do not wrap ``topic`` again. Google News drops a query that is already
++    # parenthesized when another pair of parentheses is added in front of
++    # after:/before:.
++    return f"{topic} after:{start_date} before:{_day_after(end_date)}"
++
++
++def _day_after(day: str) -> str:
++    return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
++
++
++def _search(query: str) -> list[NewsItem]:
++    config = get_config()
++    params = {
++        "q": query,
++        "hl": config.get("google_news_hl") or "en-US",
++        "gl": config.get("google_news_gl") or "US",
++        "ceid": config.get("google_news_ceid") or "US:en",
++    }
++    cache_key = "google-news:" + urllib.parse.urlencode(params)
++    cached = cache_get(cache_key)
++    if cached is not None:
++        try:
++            return load_items(cached)
++        except (ValueError, TypeError, KeyError):
++            logger.warning("Ignoring an unreadable Google News cache entry")
++    xml_text = _fetch(params)
++    items = parse_feed(xml_text)
++    cache_set(cache_key, dump_items(items))
++    return items
++
++
++def _fetch(params: dict) -> str:
++    response = http_request(
++        "GET",
++        RSS_URL,
++        params=params,
++        headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml"},
++        timeout=http_timeout(),
++        max_retries=http_retries(),
++    )
++    if response.status_code != 200:
++        raise VendorUnavailableError(f"Google News RSS HTTP {response.status_code}")
++    return response.content.decode("utf-8", errors="replace")
++
++
++def parse_feed(xml_text: str) -> list[NewsItem]:
++    """RSS 2.0 or Atom items. Bad XML is an outage, not an empty news day."""
++    if "<!ENTITY" in xml_text.upper():
++        raise VendorUnavailableError("Google News RSS contained a DTD entity and was refused")
++    try:
++        root = ET.fromstring(xml_text)
++    except ET.ParseError:
++        raise VendorUnavailableError("Google News RSS was not valid XML") from None
++    items = []
++    for node in root.iter():
++        kind = node.tag.rsplit("}", 1)[-1]
++        if kind not in {"item", "entry"}:
++            continue
++        item = _item_from(node)
++        if item is not None:
++            items.append(item)
++    return items
++
++
++def _item_from(node: ET.Element) -> NewsItem | None:
++    title = _text(node, "title")
++    if not title:
++        return None
++    link = _link(node)
++    published = parse_http_date(_text(node, "pubDate") or _text(node, "published") or _text(node, "updated"))
++    source_name, source_url = _source(node)
++    snippet = _snippet(_text(node, "description") or _text(node, "summary") or _text(node, "content"))
++    return NewsItem(
++        title=title,
++        url=link,
++        publisher=source_name or "Google News",
++        snippet=snippet,
++        published_at=published,
++        attribution="Google News RSS",
++        publisher_site=source_url,
++    )
++
++
++def _text(node: ET.Element, name: str) -> str:
++    for child in node:
++        if child.tag.rsplit("}", 1)[-1] == name and child.text:
++            return " ".join(child.text.split())
++    return ""
++
++
++def _link(node: ET.Element) -> str:
++    for child in node:
++        if child.tag.rsplit("}", 1)[-1] != "link":
++            continue
++        href = http_url(child.get("href") or "") or http_url(child.text or "")
++        if href:
++            return href
++    return ""
++
++
++def _source(node: ET.Element) -> tuple[str, str]:
++    for child in node:
++        if child.tag.rsplit("}", 1)[-1] != "source":
++            continue
++        name = " ".join((child.text or "").split())
++        return name, http_url(child.get("url") or "")
++    return "", ""
++
++
++def _snippet(raw: str) -> str:
++    if not raw:
++        return ""
++    text = " ".join(html.unescape(_TAG.sub(" ", raw)).split())
++    if text.startswith("http://") or text.startswith("https://"):
++        return ""
++    return text
+diff --git a/tradingagents/default_config.py b/tradingagents/default_config.py
+index 2ce4fad..09f7bfe 100644
+--- a/tradingagents/default_config.py
++++ b/tradingagents/default_config.py
+@@ -141,8 +141,10 @@ def build_default_config() -> dict:
+         "news_article_limit": 20,             # max articles per ticker (ticker-news)
+         "global_news_article_limit": 10,      # max articles for global/macro news
+         "global_news_lookback_days": 7,       # macro news lookback window
+-        # Search queries used by get_global_news for macro headlines. Extend or
+-        # replace to broaden geographic / sector coverage.
++        # Search queries used by the Yahoo get_global_news path. Extend or
++        # replace to broaden geographic / sector coverage. Google News RSS and
++        # AnySearch use news_macro_queries instead, so this list can stay as it
++        # is on a deployment that still has a local Yahoo news patch.
+         "global_news_queries": [
+             "Federal Reserve interest rates inflation",
+             "S&P 500 earnings GDP economic outlook",
+@@ -150,6 +152,38 @@ def build_default_config() -> dict:
+             "ECB Bank of England BOJ central bank policy",
+             "oil commodities supply chain energy",
+         ],
++        # Topic-constrained macro queries for Google News RSS (every query) and
++        # AnySearch finance.news type=general (the first anysearch_macro_query_limit).
++        # Boolean groups keep the search on rates, markets, policy, and energy
++        # instead of an unscoped "news" query. AnySearch has no separate topic
++        # parameter; type=general is its documented English-finance constraint.
++        "news_macro_queries": [
++            '(Federal Reserve OR FOMC) ("interest rate" OR inflation OR "monetary policy")',
++            '("stock market" OR "S&P 500") (earnings OR GDP OR "economic outlook")',
++            '(tariff OR sanctions OR "trade war") (market OR economy OR stocks)',
++            '(ECB OR "Bank of England" OR "Bank of Japan") ("central bank" OR "interest rate")',
++            '(oil OR crude OR OPEC) (price OR supply OR energy) (market OR economy)',
++        ],
++        # Shared HTTP budget for the news vendors. Retries are attempts after
++        # the first. Cache entries hold public headlines only, never an API key.
++        "news_http_timeout_seconds": 12.0,
++        "news_http_max_retries": 1,
++        "news_cache_ttl_seconds": 900,
++        "news_snippet_chars": 480,
++        # When Google News RSS answers a window that reaches today, also ask
++        # AnySearch and append rows it did not already return. Past windows
++        # skip AnySearch: it has no reliable publication time.
++        "news_anysearch_supplement": True,
++        "google_news_hl": "en-US",
++        "google_news_gl": "US",
++        "google_news_ceid": "US:en",
++        "anysearch_base_url": "https://api.anysearch.com",
++        "anysearch_language": "en",
++        "anysearch_zone": "intl",
++        "anysearch_macro_query_limit": 2,
++        "anysearch_max_results": 10,
++        "anysearch_max_period_days": 14,
++        "anysearch_quota_backoff_seconds": 60,
+         # Data vendor configuration
+         # Category-level configuration (default for all tools in category).
+         # The configured value is the exact vendor chain — requests are NOT silently
+@@ -161,13 +195,22 @@ def build_default_config() -> dict:
+             # Statements come from SEC EDGAR as filed (US filers), then Yahoo; the
+         # overview and insider tools, which SEC EDGAR does not serve, from Yahoo.
+         "fundamental_data": "sec_edgar,yfinance",  # Options: sec_edgar, alpha_vantage, yfinance
++            # Insider transactions follow this category. get_news and
++            # get_global_news are overridden in tool_vendors so a blocked Yahoo
++            # news feed is not the first call. Prices and fundamentals are
++            # unchanged.
+             "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
+             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
+         },
+-        # Tool-level configuration (takes precedence over category-level)
++        # Tool-level configuration (takes precedence over category-level).
++        # google_news is Google News RSS (dated). anysearch is the live
++        # finance.news fallback (undated; needs ANYSEARCH_API_KEY). Add
++        # yfinance to the end of either chain to keep Yahoo as a later option.
++        # Do not put alpha_vantage here: NEWS_SENTIMENT is a premium endpoint.
+         "tool_vendors": {
+-            # Example: "get_stock_data": "alpha_vantage",  # Override category default
++            "get_news": "google_news,anysearch",
++            "get_global_news": "google_news,anysearch",
+         },
+         # Benchmark for alpha calculation in the reflection layer.
+         # ``benchmark_ticker`` (when set) overrides the suffix map for all

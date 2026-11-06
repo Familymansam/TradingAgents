@@ -244,14 +244,19 @@ def test_a_yahoo_news_outage_moves_to_the_next_configured_vendor(monkeypatch):
         return "OTHER VENDOR NEWS"
 
     saved = dict(get_config()["data_vendors"])
-    set_config({"data_vendors": {**saved, "news_data": "yfinance,alpha_vantage"}})
+    saved_tools = dict(get_config()["tool_vendors"])
+    # get_news is selected in tool_vendors, which beats the news_data category.
+    set_config({
+        "data_vendors": {**saved, "news_data": "yfinance,alpha_vantage"},
+        "tool_vendors": {"get_news": "yfinance,alpha_vantage"},
+    })
     try:
         with patch.dict(router.VENDOR_METHODS, {"get_news": {
             "yfinance": ynews.get_news_yfinance, "alpha_vantage": other_vendor,
         }}):
             out = router.route_to_vendor("get_news", "AAPL", "2026-10-01", "2026-10-02")
     finally:
-        set_config({"data_vendors": saved})
+        set_config({"data_vendors": saved, "tool_vendors": saved_tools})
     assert out == "OTHER VENDOR NEWS" and len(calls) == 1
 
 

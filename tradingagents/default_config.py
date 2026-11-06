@@ -141,8 +141,10 @@ def build_default_config() -> dict:
         "news_article_limit": 20,             # max articles per ticker (ticker-news)
         "global_news_article_limit": 10,      # max articles for global/macro news
         "global_news_lookback_days": 7,       # macro news lookback window
-        # Search queries used by get_global_news for macro headlines. Extend or
-        # replace to broaden geographic / sector coverage.
+        # Search queries used by the Yahoo get_global_news path. Extend or
+        # replace to broaden geographic / sector coverage. Google News RSS and
+        # AnySearch use news_macro_queries instead, so this list can stay as it
+        # is on a deployment that still has a local Yahoo news patch.
         "global_news_queries": [
             "Federal Reserve interest rates inflation",
             "S&P 500 earnings GDP economic outlook",
@@ -150,6 +152,38 @@ def build_default_config() -> dict:
             "ECB Bank of England BOJ central bank policy",
             "oil commodities supply chain energy",
         ],
+        # Topic-constrained macro queries for Google News RSS (every query) and
+        # AnySearch finance.news type=general (the first anysearch_macro_query_limit).
+        # Boolean groups keep the search on rates, markets, policy, and energy
+        # instead of an unscoped "news" query. AnySearch has no separate topic
+        # parameter; type=general is its documented English-finance constraint.
+        "news_macro_queries": [
+            '(Federal Reserve OR FOMC) ("interest rate" OR inflation OR "monetary policy")',
+            '("stock market" OR "S&P 500") (earnings OR GDP OR "economic outlook")',
+            '(tariff OR sanctions OR "trade war") (market OR economy OR stocks)',
+            '(ECB OR "Bank of England" OR "Bank of Japan") ("central bank" OR "interest rate")',
+            '(oil OR crude OR OPEC) (price OR supply OR energy) (market OR economy)',
+        ],
+        # Shared HTTP budget for the news vendors. Retries are attempts after
+        # the first. Cache entries hold public headlines only, never an API key.
+        "news_http_timeout_seconds": 12.0,
+        "news_http_max_retries": 1,
+        "news_cache_ttl_seconds": 900,
+        "news_snippet_chars": 480,
+        # When Google News RSS answers a window that reaches today, also ask
+        # AnySearch and append rows it did not already return. Past windows
+        # skip AnySearch: it has no reliable publication time.
+        "news_anysearch_supplement": True,
+        "google_news_hl": "en-US",
+        "google_news_gl": "US",
+        "google_news_ceid": "US:en",
+        "anysearch_base_url": "https://api.anysearch.com",
+        "anysearch_language": "en",
+        "anysearch_zone": "intl",
+        "anysearch_macro_query_limit": 2,
+        "anysearch_max_results": 10,
+        "anysearch_max_period_days": 14,
+        "anysearch_quota_backoff_seconds": 60,
         # Data vendor configuration
         # Category-level configuration (default for all tools in category).
         # The configured value is the exact vendor chain — requests are NOT silently
@@ -161,13 +195,22 @@ def build_default_config() -> dict:
             # Statements come from SEC EDGAR as filed (US filers), then Yahoo; the
         # overview and insider tools, which SEC EDGAR does not serve, from Yahoo.
         "fundamental_data": "sec_edgar,yfinance",  # Options: sec_edgar, alpha_vantage, yfinance
+            # Insider transactions follow this category. get_news and
+            # get_global_news are overridden in tool_vendors so a blocked Yahoo
+            # news feed is not the first call. Prices and fundamentals are
+            # unchanged.
             "news_data": "yfinance",             # Options: alpha_vantage, yfinance
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
         },
-        # Tool-level configuration (takes precedence over category-level)
+        # Tool-level configuration (takes precedence over category-level).
+        # google_news is Google News RSS (dated). anysearch is the live
+        # finance.news fallback (undated; needs ANYSEARCH_API_KEY). Add
+        # yfinance to the end of either chain to keep Yahoo as a later option.
+        # Do not put alpha_vantage here: NEWS_SENTIMENT is a premium endpoint.
         "tool_vendors": {
-            # Example: "get_stock_data": "alpha_vantage",  # Override category default
+            "get_news": "google_news,anysearch",
+            "get_global_news": "google_news,anysearch",
         },
         # Benchmark for alpha calculation in the reflection layer.
         # ``benchmark_ticker`` (when set) overrides the suffix map for all

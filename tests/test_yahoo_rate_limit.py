@@ -51,6 +51,11 @@ def yahoo(monkeypatch, tmp_path):
     pytest.param(get_insider_transactions, ("AAPL",), id="insider"),
 ])
 def test_a_rate_limit_that_outlasts_the_retries_is_reported_as_one(yahoo, tool, args):
+    # News tools default to Google News RSS. Pin Yahoo so this still tests the
+    # Yahoo rate-limit path the tool used to take first.
+    set_config({
+        "tool_vendors": {"get_news": "yfinance", "get_global_news": "yfinance"},
+    })
     for name in ("history", "get_news"):
         yahoo.setattr(yf.Ticker, name, _rate_limited)
     yahoo.setattr(yf.Ticker, "insider_transactions", property(_rate_limited))
